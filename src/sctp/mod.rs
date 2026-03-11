@@ -22,7 +22,9 @@ mod error;
 pub use error::SctpError;
 
 /// Bytes that can be buffered inside str0m across all streams.
-const MAX_BUFFERED_ACROSS_STREAMS: usize = 128 * 1024;
+// Allow a larger in-flight window per peer connection so high-bandwidth
+// localhost and LAN sessions are not capped by a tiny application buffer.
+const MAX_BUFFERED_ACROSS_STREAMS: usize = 1024 * 1024;
 
 pub(crate) struct RtcSctp {
     state: RtcSctpState,
