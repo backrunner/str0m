@@ -24,7 +24,7 @@ pub use error::SctpError;
 /// Bytes that can be buffered inside str0m across all streams.
 // Allow a larger in-flight window per peer connection so high-bandwidth
 // localhost and LAN sessions are not capped by a tiny application buffer.
-const MAX_BUFFERED_ACROSS_STREAMS: usize = 1024 * 1024;
+const MAX_BUFFERED_ACROSS_STREAMS: usize = 8 * 1024 * 1024;
 
 pub(crate) struct RtcSctp {
     state: RtcSctpState,
@@ -380,7 +380,7 @@ impl RtcSctp {
             })
             .sum();
 
-        MAX_BUFFERED_ACROSS_STREAMS - total
+        MAX_BUFFERED_ACROSS_STREAMS.saturating_sub(total)
     }
 
     pub fn write(&mut self, id: u16, binary: bool, buf: &[u8]) -> Result<usize, SctpError> {
