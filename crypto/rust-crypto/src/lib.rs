@@ -12,6 +12,8 @@ use sha256::RustCryptoSha256Provider;
 use srtp::RustCryptoSrtpProvider;
 use str0m_proto::crypto::CryptoProvider;
 
+pub use dtls::{dtls_queue_limits, set_dtls_queue_limits};
+
 /// Create the default RustCrypto crypto provider.
 ///
 /// This provider implements all cryptographic operations required for WebRTC:

@@ -130,20 +130,20 @@ impl Dtls {
 
         self.instance
             .handle_packet(packet)
-            .map_err(|e| DtlsError::CryptoError(CryptoError::Other(format!("DTLS error: {}", e))))
+            .map_err(|e| DtlsError::CryptoError(CryptoError::DtlsImpl(e)))
     }
 
     /// Send application data over DTLS.
     pub fn handle_input(&mut self, data: &[u8]) -> Result<(), DtlsError> {
         self.instance
             .send_application_data(data)
-            .map_err(|e| DtlsError::CryptoError(CryptoError::Other(format!("DTLS error: {}", e))))
+            .map_err(|e| DtlsError::CryptoError(CryptoError::DtlsImpl(e)))
     }
 
     /// Handle a timeout event.
     pub fn handle_timeout(&mut self, now: Instant) -> Result<(), DtlsError> {
         self.instance
             .handle_timeout(now)
-            .map_err(|e| DtlsError::CryptoError(CryptoError::Other(format!("DTLS error: {}", e))))
+            .map_err(|e| DtlsError::CryptoError(CryptoError::DtlsImpl(e)))
     }
 }

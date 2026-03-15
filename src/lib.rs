@@ -674,6 +674,7 @@ pub use ice_::{Candidate, CandidateBuilder, CandidateKind, IceConnectionState, I
 #[path = "config.rs"]
 mod config_mod;
 pub use config_mod::RtcConfig;
+pub use crypto::{dtls_queue_limits, set_dtls_queue_limits};
 
 /// Additional configuration.
 pub mod config {

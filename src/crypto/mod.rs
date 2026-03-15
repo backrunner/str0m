@@ -54,6 +54,33 @@ pub fn from_feature_flags() -> CryptoProvider {
     );
 }
 
+/// Configure the DTLS implementation queue limits used for newly created peers.
+///
+/// The limits are applied by the active crypto backend when it constructs a new
+/// DTLS instance. Values lower than 1 are clamped by the backend helpers.
+#[allow(unreachable_code, clippy::needless_return)]
+pub fn set_dtls_queue_limits(max_queue_rx: usize, max_queue_tx: usize) {
+    #[cfg(feature = "aws-lc-rs")]
+    return str0m_aws_lc_rs::set_dtls_queue_limits(max_queue_rx, max_queue_tx);
+
+    #[cfg(feature = "rust-crypto")]
+    return str0m_rust_crypto::set_dtls_queue_limits(max_queue_rx, max_queue_tx);
+
+    let _ = (max_queue_rx, max_queue_tx);
+}
+
+/// Return the DTLS implementation queue limits that will be used for new peers.
+#[allow(unreachable_code, clippy::needless_return)]
+pub fn dtls_queue_limits() -> (usize, usize) {
+    #[cfg(feature = "aws-lc-rs")]
+    return str0m_aws_lc_rs::dtls_queue_limits();
+
+    #[cfg(feature = "rust-crypto")]
+    return str0m_rust_crypto::dtls_queue_limits();
+
+    (256, 64)
+}
+
 mod finger;
 pub use finger::Fingerprint;
 
