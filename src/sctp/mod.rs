@@ -235,7 +235,9 @@ impl RtcSctp {
         // DTLS above MTU 1200: 1277
         // Let's try 1120, see if we can avoid warnings.
         config.max_payload_size(1120);
-        let server_config = ServerConfig::default();
+        let mut server_config = ServerConfig::default();
+        server_config.transport =
+            Arc::new(TransportConfig::default().with_ack_delay_enabled(false));
         let endpoint = Endpoint::new(Arc::new(config), Some(Arc::new(server_config)));
         let fake_addr = "1.1.1.1:5000".parse().unwrap();
 
@@ -268,7 +270,8 @@ impl RtcSctp {
             // and SCTP should not give up until ICE gives up.
             let transport = TransportConfig::default()
                 .with_max_init_retransmits(None)
-                .with_max_data_retransmits(None);
+                .with_max_data_retransmits(None)
+                .with_ack_delay_enabled(false);
 
             let config = ClientConfig {
                 transport: Arc::new(transport),
