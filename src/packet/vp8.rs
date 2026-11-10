@@ -1,8 +1,375 @@
-use crate::rtp_::{extend_u15, extend_u7, extend_u8};
+use std::error::Error;
+use std::fmt;
+
+use crate::rtp_::{extend_u7, extend_u8, extend_u15};
 
 use super::{BitRead, CodecExtra, Depacketizer, PacketError, Packetizer};
 
 pub const VP8_HEADER_SIZE: usize = 1;
+
+const PICTURE_ID_SHORT_MAX: u16 = 0x7f; // 7-bit PictureID, excluding the M bit
+const PICTURE_ID_MAX: u16 = 0x7fff; // 15-bit PictureID, excluding the M bit
+const PICTURE_ID_SHORT_MASK: u8 = PICTURE_ID_SHORT_MAX as u8;
+const KEY_IDX_MASK: u8 = 0x1f; // 5-bit KEYIDX mask within the TID/Y/KEYIDX octet
+const VP8_PATCH_BYTES: usize = 4; // two PictureID bytes, TL0PICIDX and KEYIDX
+
+/// Validated byte replacements for a VP8 payload descriptor.
+///
+/// Build this from [`Vp8Descriptor::patch`] when the caller already parsed the
+/// payload descriptor before fanout. The patch is fixed-size and never changes
+/// payload length.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Vp8Patch {
+    len: u8,
+    offsets: [u8; VP8_PATCH_BYTES],
+    bytes: [u8; VP8_PATCH_BYTES],
+}
+
+impl Vp8Patch {
+    fn new() -> Self {
+        Self {
+            len: 0,
+            offsets: [0; VP8_PATCH_BYTES],
+            bytes: [0; VP8_PATCH_BYTES],
+        }
+    }
+
+    fn push(&mut self, offset: usize, byte: u8) {
+        let index = usize::from(self.len);
+        debug_assert!(index < self.offsets.len());
+        debug_assert!(offset <= usize::from(u8::MAX));
+
+        self.offsets[index] = offset as u8;
+        self.bytes[index] = byte;
+        self.len += 1;
+    }
+
+    /// Copy `payload` into `dst` while applying VP8 descriptor byte replacements.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `dst` is not the same length as `payload`.
+    pub(crate) fn copy_to(&self, payload: &[u8], dst: &mut [u8]) {
+        assert_eq!(payload.len(), dst.len());
+
+        dst.copy_from_slice(payload);
+
+        for i in 0..usize::from(self.len) {
+            dst[usize::from(self.offsets[i])] = self.bytes[i];
+        }
+    }
+}
+
+/// Errors returned when a VP8 payload descriptor cannot be parsed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Vp8DescriptorError {
+    /// The payload is too short to contain a valid VP8 payload descriptor.
+    ShortPayload,
+    /// The payload descriptor violates VP8 payload descriptor rules.
+    MalformedDescriptor,
+}
+
+impl fmt::Display for Vp8DescriptorError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ShortPayload => write!(f, "VP8 payload is too short"),
+            Self::MalformedDescriptor => write!(f, "VP8 payload descriptor is malformed"),
+        }
+    }
+}
+
+impl Error for Vp8DescriptorError {}
+
+/// Errors returned when a VP8 payload descriptor patch cannot be built.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Vp8PatchError {
+    /// The payload descriptor does not contain a PictureID field.
+    PictureIdMissing,
+    /// The requested PictureID does not fit the existing descriptor width.
+    PictureIdTooLarge,
+    /// The payload descriptor does not contain a TL0PICIDX field.
+    Tl0PicIdxMissing,
+    /// The payload descriptor does not contain a KEYIDX field.
+    KeyIdxMissing,
+    /// The requested KEYIDX does not fit the five-bit KEYIDX field.
+    KeyIdxTooLarge,
+}
+
+impl fmt::Display for Vp8PatchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PictureIdMissing => write!(f, "VP8 payload descriptor has no PictureID"),
+            Self::PictureIdTooLarge => write!(f, "VP8 PictureID does not fit descriptor width"),
+            Self::Tl0PicIdxMissing => write!(f, "VP8 payload descriptor has no TL0PICIDX"),
+            Self::KeyIdxMissing => write!(f, "VP8 payload descriptor has no KEYIDX"),
+            Self::KeyIdxTooLarge => write!(f, "VP8 KEYIDX must fit in 5 bits"),
+        }
+    }
+}
+
+impl Error for Vp8PatchError {}
+
+/// Builder for fixed-size VP8 payload descriptor patches.
+#[derive(Clone, Copy, Debug)]
+pub struct Vp8PatchBuilder {
+    descriptor: Vp8Descriptor,
+    picture_id: Option<u16>,
+    tl0_pic_idx: Option<u8>,
+    key_idx: Option<u8>,
+}
+
+impl Vp8PatchBuilder {
+    /// Rewrite the VP8 PictureID field.
+    ///
+    /// The parsed descriptor decides whether the existing descriptor uses the
+    /// 7-bit or 15-bit PictureID representation. Rewriting preserves that
+    /// representation.
+    ///
+    /// [`Vp8PatchBuilder::build`] returns [`Vp8PatchError::PictureIdTooLarge`]
+    /// if the value does not fit the existing representation.
+    pub fn picture_id(mut self, picture_id: u16) -> Self {
+        self.picture_id = Some(picture_id);
+        self
+    }
+
+    /// Rewrite the VP8 TL0PICIDX field.
+    ///
+    /// The rewrite is valid only when the payload descriptor already contains an
+    /// TL0PICIDX field.
+    pub fn tl0_pic_idx(mut self, tl0_pic_idx: u8) -> Self {
+        self.tl0_pic_idx = Some(tl0_pic_idx);
+        self
+    }
+
+    /// Rewrite the VP8 KEYIDX field.
+    ///
+    /// Only the lower five KEYIDX bits are replaced. The TID and Y bits in the
+    /// same descriptor octet are preserved.
+    ///
+    /// [`Vp8PatchBuilder::build`] returns [`Vp8PatchError::KeyIdxTooLarge`] if
+    /// the value does not fit the five-bit KEYIDX field.
+    pub fn key_idx(mut self, key_idx: u8) -> Self {
+        self.key_idx = Some(key_idx);
+        self
+    }
+
+    /// Build a validated fixed-size VP8 descriptor patch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Vp8PatchError::PictureIdMissing`],
+    /// [`Vp8PatchError::Tl0PicIdxMissing`] or [`Vp8PatchError::KeyIdxMissing`]
+    /// when the requested rewrite targets a descriptor field that is absent.
+    /// Returns [`Vp8PatchError::PictureIdTooLarge`] or
+    /// [`Vp8PatchError::KeyIdxTooLarge`] when a requested rewrite value does
+    /// not fit the field representation.
+    pub fn build(self) -> Result<Vp8Patch, Vp8PatchError> {
+        let mut patch = Vp8Patch::new();
+
+        if let Some(picture_id) = self.picture_id {
+            let Some(parsed) = self.descriptor.picture_id else {
+                return Err(Vp8PatchError::PictureIdMissing);
+            };
+            if picture_id > PICTURE_ID_MAX {
+                return Err(Vp8PatchError::PictureIdTooLarge);
+            }
+            if !parsed.is_15_bit && picture_id > PICTURE_ID_SHORT_MAX {
+                return Err(Vp8PatchError::PictureIdTooLarge);
+            }
+            if parsed.is_15_bit {
+                patch.push(
+                    parsed.offset,
+                    0x80 | ((picture_id >> 8) as u8 & PICTURE_ID_SHORT_MASK),
+                );
+                patch.push(parsed.offset + 1, picture_id as u8);
+            } else {
+                patch.push(parsed.offset, picture_id as u8);
+            }
+        }
+
+        if let Some(tl0_pic_idx) = self.tl0_pic_idx {
+            let Some(parsed) = self.descriptor.tl0_pic_idx else {
+                return Err(Vp8PatchError::Tl0PicIdxMissing);
+            };
+            patch.push(parsed.offset, tl0_pic_idx);
+        }
+
+        if let Some(key_idx) = self.key_idx {
+            let Some(parsed) = self.descriptor.key_idx else {
+                return Err(Vp8PatchError::KeyIdxMissing);
+            };
+            if key_idx > KEY_IDX_MASK {
+                return Err(Vp8PatchError::KeyIdxTooLarge);
+            }
+            patch.push(parsed.offset, (parsed.value & !KEY_IDX_MASK) | key_idx);
+        }
+
+        Ok(patch)
+    }
+}
+
+/// Parsed VP8 RTP payload descriptor.
+///
+/// The descriptor stores VP8 fields plus private offsets needed to
+/// build a validated [`Vp8Patch`]. It is valid only for the payload bytes parsed
+/// by [`Vp8Descriptor::parse`] or a byte-identical copy of those bytes.
+#[derive(Clone, Copy, Debug)]
+pub struct Vp8Descriptor {
+    payload_offset: usize,
+    picture_id: Option<Vp8PictureId>,
+    tl0_pic_idx: Option<Vp8Field>,
+    key_idx: Option<Vp8Field>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Vp8Field {
+    value: u8,
+    offset: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Vp8PictureId {
+    value: u16,
+    offset: usize,
+    is_15_bit: bool,
+}
+
+impl Vp8Descriptor {
+    /// Parse a VP8 RTP payload descriptor
+    ///
+    /// The input must be the RTP payload only. It must not include the RTP
+    /// header.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Vp8DescriptorError::ShortPayload`] when the payload is truncated.
+    /// Returns [`Vp8DescriptorError::MalformedDescriptor`] when the descriptor
+    /// has unsupported field combinations.
+    pub fn parse(payload: &[u8]) -> Result<Self, Vp8DescriptorError> {
+        let Some(required) = payload.first() else {
+            return Err(Vp8DescriptorError::ShortPayload);
+        };
+
+        let mut descriptor = Self {
+            payload_offset: 1,
+            picture_id: None,
+            tl0_pic_idx: None,
+            key_idx: None,
+        };
+
+        if required & 0x80 != 0 {
+            let extension = read_vp8_descriptor_byte(payload, &mut descriptor.payload_offset)?;
+            let has_picture_id = extension & 0x80 != 0;
+            let has_tl0_pic_idx = extension & 0x40 != 0;
+            let has_tid = extension & 0x20 != 0;
+            let has_key_idx = extension & 0x10 != 0;
+
+            if has_tl0_pic_idx && !has_tid {
+                return Err(Vp8DescriptorError::MalformedDescriptor);
+            }
+
+            if has_picture_id {
+                let picture_id_offset = descriptor.payload_offset;
+                let picture_id = read_vp8_descriptor_byte(payload, &mut descriptor.payload_offset)?;
+                let is_15_bit = picture_id & 0x80 != 0;
+                let value = if is_15_bit {
+                    let picture_id_low =
+                        read_vp8_descriptor_byte(payload, &mut descriptor.payload_offset)?;
+                    (u16::from(picture_id & PICTURE_ID_SHORT_MASK) << 8) | u16::from(picture_id_low)
+                } else {
+                    u16::from(picture_id & PICTURE_ID_SHORT_MASK)
+                };
+                descriptor.picture_id = Some(Vp8PictureId {
+                    value,
+                    offset: picture_id_offset,
+                    is_15_bit,
+                });
+            }
+
+            if has_tl0_pic_idx {
+                let offset = descriptor.payload_offset;
+                let value = read_vp8_descriptor_byte(payload, &mut descriptor.payload_offset)?;
+                descriptor.tl0_pic_idx = Some(Vp8Field { value, offset });
+            }
+
+            if has_tid || has_key_idx {
+                let offset = descriptor.payload_offset;
+                let value = read_vp8_descriptor_byte(payload, &mut descriptor.payload_offset)?;
+                if has_key_idx {
+                    descriptor.key_idx = Some(Vp8Field { value, offset });
+                }
+            }
+        }
+
+        if descriptor.payload_offset >= payload.len() {
+            return Err(Vp8DescriptorError::ShortPayload);
+        }
+
+        Ok(descriptor)
+    }
+
+    /// Returns the VP8 PictureID if present
+    pub const fn picture_id(&self) -> Option<u16> {
+        match self.picture_id {
+            Some(picture_id) => Some(picture_id.value),
+            None => None,
+        }
+    }
+
+    /// Returns the VP8 TL0PICIDX if present
+    pub const fn tl0_pic_idx(&self) -> Option<u8> {
+        match self.tl0_pic_idx {
+            Some(tl0_pic_idx) => Some(tl0_pic_idx.value),
+            None => None,
+        }
+    }
+
+    /// returns the VP8 KEYIDX if present
+    pub const fn key_idx(&self) -> Option<u8> {
+        match self.key_idx {
+            Some(key_idx) => Some(key_idx.value & KEY_IDX_MASK),
+            None => None,
+        }
+    }
+
+    /// Returns whether this descriptor starts a VP8 keyframe.
+    ///
+    /// `payload` must be the same payload that produced this descriptor or a
+    /// byte-identical copy. A mismatched or shorter payload returns `false`.
+    pub fn starts_keyframe(&self, payload: &[u8]) -> bool {
+        let Some(required) = payload.first() else {
+            return false;
+        };
+
+        if required & 0x10 == 0 || required & 0x07 != 0 {
+            return false;
+        }
+
+        payload
+            .get(self.payload_offset)
+            .is_some_and(|header| header & 0x01 == 0)
+    }
+
+    /// Start building a validated fixed-size VP8 descriptor patch.
+    pub fn patch(&self) -> Vp8PatchBuilder {
+        Vp8PatchBuilder {
+            descriptor: *self,
+            picture_id: None,
+            tl0_pic_idx: None,
+            key_idx: None,
+        }
+    }
+}
+
+fn read_vp8_descriptor_byte(payload: &[u8], offset: &mut usize) -> Result<u8, Vp8DescriptorError> {
+    let byte = payload
+        .get(*offset)
+        .ok_or(Vp8DescriptorError::ShortPayload)?;
+    *offset += 1;
+    Ok(*byte)
+}
 
 /// Vp8 information describing the depacketized / packetized data
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,6 +391,61 @@ pub struct Vp8CodecExtra {
     ///
     /// [`MediaData`]: crate::media::MediaData
     pub is_keyframe: bool,
+}
+
+/// Detect whether a VP8 RTP payload contains a keyframe.
+///
+/// Parses the VP8 RTP payload descriptor (RFC 7741) to skip past the
+/// variable-length header, then checks the P bit in the VP8 payload header.
+/// P=0 means keyframe, P=1 means interframe.
+///
+/// Returns `true` only for the first packet of a keyframe (S=1, PID=0).
+pub fn detect_vp8_keyframe(payload: &[u8]) -> bool {
+    if payload.is_empty() {
+        return false;
+    }
+    let b0 = payload[0];
+    let s = (b0 & 0x10) >> 4; // Start of VP8 partition
+    let pid = b0 & 0x07; // Partition index
+    // Only the first packet of a frame (S=1, PID=0) contains the payload header
+    if s != 1 || pid != 0 {
+        return false;
+    }
+    let x = (b0 & 0x80) >> 7; // Extension bit
+    let mut idx = 1;
+    if x == 1 {
+        if idx >= payload.len() {
+            return false;
+        }
+        let ext = payload[idx];
+        idx += 1;
+        let i = (ext & 0x80) >> 7; // PictureID present
+        let l = (ext & 0x40) >> 6; // TL0PICIDX present
+        let t = (ext & 0x20) >> 5; // TID present
+        let k = (ext & 0x10) >> 4; // KEYIDX present
+        if i == 1 {
+            if idx >= payload.len() {
+                return false;
+            }
+            if payload[idx] & 0x80 != 0 {
+                idx += 2; // 16-bit PictureID
+            } else {
+                idx += 1; // 7-bit PictureID
+            }
+        }
+        if l == 1 {
+            idx += 1; // tl0picidx
+        }
+        if t == 1 || k == 1 {
+            idx += 1; // TID/KEYIDX
+        }
+    }
+    if idx >= payload.len() {
+        return false;
+    }
+    // VP8 Payload Header: P bit is bit 0 of the first byte
+    // P=0 → keyframe, P=1 → interframe
+    payload[idx] & 0x01 == 0
 }
 
 /// Packetizes VP8 RTP packets.
@@ -100,11 +522,12 @@ impl Packetizer for Vp8Packetizer {
                 if using_header_size == VP8_HEADER_SIZE + 2 {
                     buf[0] |= 0x80;
                     buf[1] |= 0x80;
-                    buf[2] |= (self.picture_id & 0x7F) as u8;
+                    buf[2] |= (self.picture_id & u16::from(PICTURE_ID_SHORT_MASK)) as u8;
                 } else if using_header_size == VP8_HEADER_SIZE + 3 {
                     buf[0] |= 0x80;
                     buf[1] |= 0x80;
-                    buf[2] |= 0x80 | ((self.picture_id >> 8) & 0x7F) as u8;
+                    buf[2] |=
+                        0x80 | ((self.picture_id >> 8) & u16::from(PICTURE_ID_SHORT_MASK)) as u8;
                     buf[3] |= (self.picture_id & 0xFF) as u8;
                 }
             }
@@ -121,7 +544,7 @@ impl Packetizer for Vp8Packetizer {
         }
 
         self.picture_id += 1;
-        self.picture_id &= 0x7FFF;
+        self.picture_id &= PICTURE_ID_MAX;
 
         Ok(payloads)
     }
@@ -225,29 +648,51 @@ impl Depacketizer for Vp8Depacketizer {
         self.s = (b & 0x10) >> 4;
         self.pid = b & 0x07;
 
-        if self.x == 1 {
+        let (i, l, t, k) = if self.x == 1 {
             b = reader.get_u8().ok_or(PacketError::ErrShortPacket)?;
             payload_index += 1;
-            self.i = (b & 0x80) >> 7;
-            self.l = (b & 0x40) >> 6;
-            self.t = (b & 0x20) >> 5;
-            self.k = (b & 0x10) >> 4;
-        }
+            let i = (b & 0x80) >> 7;
+            let l = (b & 0x40) >> 6;
+            let t = (b & 0x20) >> 5;
+            let k = (b & 0x10) >> 4;
+
+            if l == 1 && t == 0 {
+                return Err(PacketError::ErrVP8CorruptedPacket);
+            }
+
+            (i, l, t, k)
+        } else {
+            (0, 0, 0, 0)
+        };
+        self.i = i;
+        self.l = l;
+        self.t = t;
+        self.k = k;
 
         if self.i == 1 {
             b = reader.get_u8().ok_or(PacketError::ErrShortPacket)?;
             payload_index += 1;
+            let previous_picture_id = u64::from(self.picture_id);
+            let previous = self.extended_pid.map(|_| previous_picture_id);
             // PID present?
-            if b & 0x80 > 0 {
+            let next = if b & 0x80 > 0 {
                 // M == 1, PID is 16bit
                 let x = reader.get_u8().ok_or(PacketError::ErrShortPacket)?;
-                self.picture_id = (((b & 0x7f) as u16) << 8) | (x as u16);
-                self.extended_pid = Some(extend_u15(self.extended_pid, self.picture_id));
+                self.picture_id = (((b & PICTURE_ID_SHORT_MASK) as u16) << 8) | (x as u16);
                 payload_index += 1;
+                extend_u15(previous, self.picture_id)
             } else {
                 self.picture_id = b as u16;
-                self.extended_pid = Some(extend_u7(self.extended_pid, b));
-            }
+                extend_u7(previous, b)
+            };
+
+            // "The receiver MUST NOT assume that the number of bits in PictureID stays the
+            // same through the session" (RFC 7741 section 4.2). Preserve the offset from
+            // earlier short-ID wraps by extending the raw-ID delta.
+            self.extended_pid = Some(match self.extended_pid {
+                Some(previous) => previous.wrapping_add(next.wrapping_sub(previous_picture_id)),
+                None => next,
+            });
         }
 
         if payload_index >= payload_len {
@@ -272,7 +717,7 @@ impl Depacketizer for Vp8Depacketizer {
                 self.y = (b >> 5) & 0x1;
             }
             if self.k == 1 {
-                self.key_idx = b & 0x1F;
+                self.key_idx = b & KEY_IDX_MASK;
             }
             payload_index += 1;
         }
@@ -412,18 +857,19 @@ mod test {
         assert_eq!(pck.k, 0, "K must be 0");
         assert_eq!(pck.p, 1, "P must be 1");
 
-        // Header size, X and L
+        // Header size, X and L without T
         let raw_bytes = &[0x80, 0x40, 0x00, 0x00];
         let mut payload = Vec::new();
+        assert_eq!(
+            pck.depacketize(raw_bytes, &mut payload, &mut extra),
+            Err(PacketError::ErrVP8CorruptedPacket)
+        );
+
+        let raw_bytes = &[0x00, 0x11, 0x22];
+        let mut payload = Vec::new();
         pck.depacketize(raw_bytes, &mut payload, &mut extra)
-            .expect("X and L");
-        assert!(!payload.is_empty(), "Payload must be not empty");
-        assert_eq!(pck.x, 1, "X must be 1");
-        assert_eq!(pck.i, 0, "I must be 0");
-        assert_eq!(pck.l, 1, "L must be 1");
-        assert_eq!(pck.t, 0, "T must be 0");
-        assert_eq!(pck.k, 0, "K must be 0");
-        assert_eq!(pck.p, 1, "P must be 1");
+            .expect("valid packet after malformed descriptor");
+        assert_eq!(payload, [0x11, 0x22]);
 
         // Header size, X and T
         let raw_bytes = &[0x80, 0x20, 0x00, 0x00];
@@ -595,5 +1041,337 @@ mod test {
         );
 
         Ok(())
+    }
+
+    fn rewrite_payload(
+        payload: &[u8],
+        patch: impl FnOnce(Vp8PatchBuilder) -> Vp8PatchBuilder,
+    ) -> Result<Vec<u8>, Vp8PatchError> {
+        let descriptor = Vp8Descriptor::parse(payload).expect("valid VP8 descriptor");
+        let patch = patch(descriptor.patch()).build()?;
+
+        let mut out = vec![0; payload.len()];
+        patch.copy_to(payload, &mut out);
+        Ok(out)
+    }
+
+    #[test]
+    fn test_vp8_descriptor_exposes_fields() {
+        let short = Vp8Descriptor::parse(&[0x90, 0x80, 0x42, 0x00]).unwrap();
+        assert_eq!(short.picture_id(), Some(0x42));
+        assert_eq!(short.tl0_pic_idx(), None);
+        assert_eq!(short.key_idx(), None);
+
+        let full = Vp8Descriptor::parse(&[0x90, 0xf0, 0x92, 0x34, 0x55, 0xa7, 0x00]).unwrap();
+        assert_eq!(full.picture_id(), Some(0x1234));
+        assert_eq!(full.tl0_pic_idx(), Some(0x55));
+        assert_eq!(full.key_idx(), Some(0x07));
+    }
+
+    #[test]
+    fn test_vp8_patch_updates_descriptor_fields() {
+        assert_eq!(
+            rewrite_payload(&[0x80, 0x80, 0x01, 0x90], |patch| {
+                patch.picture_id(u16::from(PICTURE_ID_SHORT_MASK))
+            })
+            .unwrap(),
+            [0x80, 0x80, PICTURE_ID_SHORT_MASK, 0x90]
+        );
+        assert_eq!(
+            rewrite_payload(&[0x80, 0x80, 0x81, 0x20, 0x90], |patch| {
+                patch.picture_id(0x0234)
+            })
+            .unwrap(),
+            [0x80, 0x80, 0x82, 0x34, 0x90]
+        );
+        assert_eq!(
+            rewrite_payload(&[0x80, 0x80, 0x81, 0x20, 0x90], |patch| {
+                patch.picture_id(PICTURE_ID_MAX)
+            })
+            .unwrap(),
+            [0x80, 0x80, 0xff, 0xff, 0x90]
+        );
+        assert_eq!(
+            rewrite_payload(&[0x80, 0x60, 0x12, 0x00, 0x90], |patch| {
+                patch.tl0_pic_idx(0xab)
+            })
+            .unwrap(),
+            [0x80, 0x60, 0xab, 0x00, 0x90]
+        );
+        assert_eq!(
+            rewrite_payload(&[0x80, 0x30, 0xaa, 0x90], |patch| {
+                patch.key_idx(KEY_IDX_MASK)
+            })
+            .unwrap(),
+            [0x80, 0x30, 0xbf, 0x90]
+        );
+    }
+
+    #[test]
+    fn test_vp8_patch_rejects_unsupported_descriptor_shapes() {
+        assert_eq!(
+            Vp8Descriptor::parse(&[0x80, 0x80]).unwrap_err(),
+            Vp8DescriptorError::ShortPayload
+        );
+        assert_eq!(
+            rewrite_payload(&[0x00, 0x90], |patch| patch.picture_id(1)).unwrap_err(),
+            Vp8PatchError::PictureIdMissing
+        );
+        assert_eq!(
+            rewrite_payload(&[0x00, 0x90], |patch| {
+                patch.picture_id(PICTURE_ID_MAX + 1)
+            })
+            .unwrap_err(),
+            Vp8PatchError::PictureIdMissing
+        );
+        assert_eq!(
+            rewrite_payload(&[0x80, 0x80, 0x81, 0x20, 0x90], |patch| {
+                patch.tl0_pic_idx(1)
+            })
+            .unwrap_err(),
+            Vp8PatchError::Tl0PicIdxMissing
+        );
+        assert_eq!(
+            rewrite_payload(&[0x80, 0x80, 0x81, 0x20, 0x90], |patch| {
+                patch.key_idx(1)
+            })
+            .unwrap_err(),
+            Vp8PatchError::KeyIdxMissing
+        );
+        assert_eq!(
+            rewrite_payload(&[0x80, 0x80, 0x81, 0x20, 0x90], |patch| {
+                patch.key_idx(KEY_IDX_MASK + 1)
+            })
+            .unwrap_err(),
+            Vp8PatchError::KeyIdxMissing
+        );
+        assert_eq!(
+            Vp8Descriptor::parse(&[0x80, 0x40, 0x12, 0x90]).unwrap_err(),
+            Vp8DescriptorError::MalformedDescriptor
+        );
+    }
+
+    #[test]
+    fn test_vp8_patch_rejects_impossible_values() {
+        assert_eq!(
+            rewrite_payload(&[0x80, 0x80, 0x01, 0x90], |patch| {
+                patch.picture_id(0x80)
+            })
+            .unwrap_err(),
+            Vp8PatchError::PictureIdTooLarge
+        );
+        assert_eq!(
+            rewrite_payload(&[0x80, 0x80, 0x81, 0x20, 0x90], |patch| {
+                patch.picture_id(PICTURE_ID_MAX + 1)
+            })
+            .unwrap_err(),
+            Vp8PatchError::PictureIdTooLarge
+        );
+        assert_eq!(
+            rewrite_payload(&[0x80, 0x10, 0x00, 0x90], |patch| {
+                patch.key_idx(KEY_IDX_MASK + 1)
+            })
+            .unwrap_err(),
+            Vp8PatchError::KeyIdxTooLarge
+        );
+    }
+
+    #[test]
+    fn test_detect_vp8_keyframe() {
+        // Empty payload
+        assert!(!detect_vp8_keyframe(&[]));
+
+        // Minimal keyframe: S=1, PID=0, no extensions, P=0
+        // Byte 0: X=0, R=0, N=0, S=1, PID=0 → 0x10
+        // Byte 1: VP8 payload header with P=0 (keyframe) → 0x00
+        assert!(detect_vp8_keyframe(&[0x10, 0x00]));
+
+        // Minimal interframe: S=1, PID=0, no extensions, P=1
+        // Byte 1: VP8 payload header with P=1 → 0x01
+        assert!(!detect_vp8_keyframe(&[0x10, 0x01]));
+
+        // Not the first packet (S=0) — cannot detect keyframe
+        assert!(!detect_vp8_keyframe(&[0x00, 0x00]));
+
+        // Continuation packet (PID != 0)
+        assert!(!detect_vp8_keyframe(&[0x11, 0x00]));
+
+        // With extension (X=1), 7-bit PictureID, keyframe
+        // Byte 0: X=1, S=1, PID=0 → 0x90
+        // Byte 1: I=1, L=0, T=0, K=0 → 0x80
+        // Byte 2: 7-bit PictureID (M=0) → 0x42
+        // Byte 3: VP8 payload header P=0 → 0x00
+        assert!(detect_vp8_keyframe(&[0x90, 0x80, 0x42, 0x00]));
+
+        // With extension, 7-bit PictureID, interframe
+        assert!(!detect_vp8_keyframe(&[0x90, 0x80, 0x42, 0x01]));
+
+        // With extension, 16-bit PictureID (M=1), keyframe
+        // Byte 2: M=1 → 0x80 | PID_high
+        // Byte 3: PID_low
+        // Byte 4: VP8 payload header P=0
+        assert!(detect_vp8_keyframe(&[0x90, 0x80, 0x80, 0x42, 0x00]));
+
+        // With all extensions: I=1(16-bit), L=1, T=1
+        // Byte 0: X=1, S=1 → 0x90
+        // Byte 1: I=1, L=1, T=1 → 0xE0
+        // Byte 2-3: 16-bit PictureID → 0x80, 0x42
+        // Byte 4: TL0PICIDX
+        // Byte 5: TID/KEYIDX
+        // Byte 6: VP8 payload header P=0
+        assert!(detect_vp8_keyframe(&[
+            0x90, 0xE0, 0x80, 0x42, 0x01, 0x00, 0x00
+        ]));
+
+        assert!(detect_vp8_keyframe(&[0x90, 0x40, 0x01, 0x00]));
+
+        // Truncated: extension says PictureID but no bytes left
+        assert!(!detect_vp8_keyframe(&[0x90, 0x80]));
+
+        // Truncated: header consumed all bytes
+        assert!(!detect_vp8_keyframe(&[0x90, 0x80, 0x42]));
+    }
+
+    #[test]
+    fn test_vp8_descriptor_keyframe_detection_matches_helper() {
+        let payloads: &[&[u8]] = &[
+            &[],
+            &[0x10, 0x00],
+            &[0x10, 0x01],
+            &[0x00, 0x00],
+            &[0x11, 0x00],
+            &[0x90, 0x80, 0x42, 0x00],
+            &[0x90, 0x80, 0x42, 0x01],
+            &[0x90, 0x80],
+            &[0x90, 0x80, 0x42],
+        ];
+
+        for payload in payloads {
+            let descriptor_starts_keyframe = Vp8Descriptor::parse(payload)
+                .map(|descriptor| descriptor.starts_keyframe(payload))
+                .unwrap_or(false);
+            assert_eq!(descriptor_starts_keyframe, detect_vp8_keyframe(payload));
+        }
+    }
+
+    #[test]
+    fn packetize_respects_mtu() -> Result<(), PacketError> {
+        let payload = vec![0xABu8; 2000];
+        for &mtu in &[100usize, 300, 600, 1200] {
+            let mut pck = Vp8Packetizer::default();
+            let pkts = pck.packetize(mtu, &payload)?;
+            assert!(!pkts.is_empty(), "VP8 produced no packets at mtu {mtu}");
+            for (i, pkt) in pkts.iter().enumerate() {
+                assert!(
+                    pkt.len() <= mtu,
+                    "VP8 packet {i} size {} > mtu {mtu}",
+                    pkt.len()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn picture_id_of(depack: &mut Vp8Depacketizer, picture_id: &[u8]) -> Option<u64> {
+        // X=1 S=1, I=1, picture id, inter frame
+        let mut packet = vec![0x90, 0x80];
+        packet.extend_from_slice(picture_id);
+        packet.push(0x01);
+        let mut payload = Vec::new();
+        let mut extra = CodecExtra::None;
+        depack
+            .depacketize(&packet, &mut payload, &mut extra)
+            .unwrap();
+        let CodecExtra::Vp8(extra) = extra else {
+            panic!("expected VP8 codec extra");
+        };
+        extra.picture_id
+    }
+
+    /// X=1 S=1, I=1 L=1 T=1, picture id, tl0picidx, TID=0
+    fn frame(keyframe: bool, picture_id: &[u8], tl0_pic_idx: u8) -> Vec<Vec<u8>> {
+        let mut packet = vec![0x90, 0xE0];
+        packet.extend_from_slice(picture_id);
+        packet.extend_from_slice(&[tl0_pic_idx, 0x00, u8::from(!keyframe)]);
+        vec![packet]
+    }
+
+    fn assert_every_frame_emitted(frames: impl IntoIterator<Item = Vec<Vec<u8>>>) {
+        use crate::packet::{CodecDepacketizer, DepacketizingBuffer, RtpMeta};
+        use crate::rtp_::{MediaTime, RtpHeader};
+        use std::time::Instant;
+
+        let mut buf =
+            DepacketizingBuffer::new(CodecDepacketizer::Vp8(Vp8Depacketizer::default()), 3);
+        let now = Instant::now();
+        let mut seq = 0_u64;
+
+        for (frame, packets) in frames.into_iter().enumerate() {
+            let count = packets.len();
+            let time = frame as u64 * 3000;
+
+            for (i, packet) in packets.into_iter().enumerate() {
+                let meta = RtpMeta {
+                    received: now,
+                    time: MediaTime::from_90khz(time),
+                    seq_no: seq.into(),
+                    last_sender_info: None,
+                    header: RtpHeader {
+                        sequence_number: seq as u16,
+                        timestamp: time as u32,
+                        marker: i == count - 1,
+                        ..Default::default()
+                    },
+                };
+                buf.push(meta, packet);
+                seq += 1;
+            }
+
+            let dep = buf
+                .pop(now, None)
+                .unwrap_or_else(|| panic!("frame {frame} was not emitted"))
+                .unwrap();
+            assert!(dep.contiguous, "frame {frame} is not contiguous");
+        }
+    }
+
+    #[test]
+    fn depacketizer_preserves_picture_id_epoch_when_width_grows() {
+        let mut depack = Vp8Depacketizer::default();
+        for (picture_id, expected) in [(126_u8, 126_u64), (127, 127), (0, 128), (1, 129)] {
+            assert_eq!(picture_id_of(&mut depack, &[picture_id]), Some(expected));
+        }
+        // The 15-bit PictureID continues incrementing from the 7-bit one.
+        assert_eq!(picture_id_of(&mut depack, &[0x80, 2]), Some(130));
+    }
+
+    #[test]
+    fn depacketizing_buffer_emits_frames_when_picture_id_width_grows() {
+        let frames = [
+            frame(true, &[126], 10),
+            frame(false, &[127], 11),
+            frame(false, &[0], 12),
+            frame(false, &[1], 13),
+            frame(false, &[0x80, 2], 14),
+            frame(false, &[0x80, 3], 15),
+        ];
+        assert_every_frame_emitted(frames);
+    }
+
+    #[test]
+    fn depacketizer_preserves_wide_picture_id_after_loss_at_width_growth() {
+        let mut depack = Vp8Depacketizer::default();
+        assert_eq!(picture_id_of(&mut depack, &[0]), Some(0));
+        // The sender widens at PictureID 1; pictures 1..99 are lost in transit.
+        assert_eq!(picture_id_of(&mut depack, &[0x80, 100]), Some(100));
+    }
+
+    #[test]
+    fn depacketizing_buffer_recovers_after_loss_at_picture_id_width_growth() {
+        // A middlebox drops pictures 1..99 and rewrites RTP sequence numbers.
+        // Picture 100 is a keyframe, so all following pictures are decodable.
+        let frames = std::iter::once(frame(true, &[0], 0))
+            .chain((100..=130_u8).map(|pid| frame(pid == 100, &[0x80, pid], pid - 99)));
+        assert_every_frame_emitted(frames);
     }
 }

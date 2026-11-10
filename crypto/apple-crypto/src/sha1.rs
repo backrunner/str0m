@@ -1,6 +1,15 @@
-//! SHA1-HMAC implementation using Apple CommonCrypto.
+//! SHA-1 hash and HMAC implementations using Apple CryptoKit.
 
-use str0m_proto::crypto::Sha1HmacProvider;
+use str0m_proto::crypto::{Sha1HmacProvider, Sha1Provider};
+
+#[derive(Debug)]
+pub(crate) struct AppleCryptoSha1Provider;
+
+impl Sha1Provider for AppleCryptoSha1Provider {
+    fn sha1(&self, data: &[u8]) -> [u8; 20] {
+        crate::cryptokit::sha1(data)
+    }
+}
 
 // SHA1 HMAC Provider Implementation
 
@@ -14,14 +23,7 @@ impl std::fmt::Debug for AppleCryptoSha1HmacProvider {
 
 impl Sha1HmacProvider for AppleCryptoSha1HmacProvider {
     fn sha1_hmac(&self, key: &[u8], payloads: &[&[u8]]) -> [u8; 20] {
-        static EMPTY: [u8; 0] = [];
-        let payload = match payloads.len() {
-            0 => &EMPTY,
-            1 => payloads[0],
-            _ => &payloads.concat(),
-        };
-
-        apple_cryptokit::hmac_sha1(key, payload).unwrap()
+        crate::cryptokit::hmac(key, payloads)
     }
 }
 

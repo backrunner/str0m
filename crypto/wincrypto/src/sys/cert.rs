@@ -1,20 +1,36 @@
 use super::WinCryptoError;
-use windows::{
-    core::{Owned, GUID, HSTRING, PSTR, PWSTR},
-    Win32::{
-        Foundation::GetLastError,
-        Security::Cryptography::{
-            szOID_ECDSA_SHA256, szOID_RSA_SHA256RSA, CertCreateSelfSignCertificate,
-            CertFreeCertificateContext, CertStrToNameW, NCryptCreatePersistedKey, NCryptDeleteKey,
-            NCryptFinalizeKey, NCryptOpenStorageProvider, CERT_CONTEXT, CERT_CREATE_SELFSIGN_FLAGS,
-            CERT_KEY_SPEC, CERT_OID_NAME_STR, CRYPT_ALGORITHM_IDENTIFIER, CRYPT_INTEGER_BLOB,
-            CRYPT_KEY_PROV_INFO, HCRYPTPROV_OR_NCRYPT_KEY_HANDLE, MS_KEY_STORAGE_PROVIDER,
-            NCRYPT_ECDSA_P256_ALGORITHM, NCRYPT_FLAGS, NCRYPT_KEY_HANDLE, NCRYPT_PROV_HANDLE,
-            NCRYPT_SILENT_FLAG, X509_ASN_ENCODING,
-        },
-        System::Rpc::{UuidCreate, UuidToStringW},
-    },
-};
+use windows::Win32::Foundation::GetLastError;
+use windows::Win32::Security::Cryptography::CERT_CONTEXT;
+use windows::Win32::Security::Cryptography::CERT_CREATE_SELFSIGN_FLAGS;
+use windows::Win32::Security::Cryptography::CERT_KEY_SPEC;
+use windows::Win32::Security::Cryptography::CERT_OID_NAME_STR;
+use windows::Win32::Security::Cryptography::CRYPT_ALGORITHM_IDENTIFIER;
+use windows::Win32::Security::Cryptography::CRYPT_INTEGER_BLOB;
+use windows::Win32::Security::Cryptography::CRYPT_KEY_PROV_INFO;
+use windows::Win32::Security::Cryptography::CertCreateSelfSignCertificate;
+use windows::Win32::Security::Cryptography::CertFreeCertificateContext;
+use windows::Win32::Security::Cryptography::CertStrToNameW;
+use windows::Win32::Security::Cryptography::HCRYPTPROV_OR_NCRYPT_KEY_HANDLE;
+use windows::Win32::Security::Cryptography::MS_KEY_STORAGE_PROVIDER;
+use windows::Win32::Security::Cryptography::NCRYPT_ECDSA_P256_ALGORITHM;
+use windows::Win32::Security::Cryptography::NCRYPT_FLAGS;
+use windows::Win32::Security::Cryptography::NCRYPT_KEY_HANDLE;
+use windows::Win32::Security::Cryptography::NCRYPT_PROV_HANDLE;
+use windows::Win32::Security::Cryptography::NCRYPT_SILENT_FLAG;
+use windows::Win32::Security::Cryptography::NCryptCreatePersistedKey;
+use windows::Win32::Security::Cryptography::NCryptDeleteKey;
+use windows::Win32::Security::Cryptography::NCryptFinalizeKey;
+use windows::Win32::Security::Cryptography::NCryptOpenStorageProvider;
+use windows::Win32::Security::Cryptography::X509_ASN_ENCODING;
+use windows::Win32::Security::Cryptography::szOID_ECDSA_SHA256;
+use windows::Win32::Security::Cryptography::szOID_RSA_SHA256RSA;
+use windows::Win32::System::Rpc::UuidCreate;
+use windows::Win32::System::Rpc::UuidToStringW;
+use windows::core::GUID;
+use windows::core::HSTRING;
+use windows::core::Owned;
+use windows::core::PSTR;
+use windows::core::PWSTR;
 
 /// Certificate wraps the CERT_CONTEXT pointer, so that it can be destroyed
 /// when it is no longer used. Because it is tracked, it is important that
@@ -82,6 +98,23 @@ impl Certificate {
                     CERT_KEY_SPEC(0),
                     NCRYPT_SILENT_FLAG,
                 )?;
+
+                // Dimpl currently requires the Certificate and Private Key as
+                // DER-encoded bytes. This will allow plaintext export so the
+                // private key can be exported in PKCS#8 format after creation.
+                {
+                    use windows::Win32::Security::Cryptography::NCRYPT_ALLOW_PLAINTEXT_EXPORT_FLAG;
+                    use windows::Win32::Security::Cryptography::NCRYPT_EXPORT_POLICY_PROPERTY;
+                    use windows::Win32::Security::Cryptography::NCryptSetProperty;
+                    let export_policy = NCRYPT_ALLOW_PLAINTEXT_EXPORT_FLAG;
+                    NCryptSetProperty(
+                        key_handle.into(),
+                        NCRYPT_EXPORT_POLICY_PROPERTY,
+                        &export_policy.to_le_bytes(),
+                        NCRYPT_SILENT_FLAG,
+                    )?;
+                }
+
                 NCryptFinalizeKey(key_handle, NCRYPT_FLAGS(0))?;
 
                 let key_prov_info = CRYPT_KEY_PROV_INFO {
@@ -97,7 +130,7 @@ impl Certificate {
 
                 (
                     CertCreateSelfSignCertificate(
-                        HCRYPTPROV_OR_NCRYPT_KEY_HANDLE(key_handle.0),
+                        Some(HCRYPTPROV_OR_NCRYPT_KEY_HANDLE(key_handle.0)),
                         &subject_blob,
                         CERT_CREATE_SELFSIGN_FLAGS(0),
                         Some(&key_prov_info as *const _ as *const _),
@@ -117,7 +150,7 @@ impl Certificate {
 
                 (
                     CertCreateSelfSignCertificate(
-                        HCRYPTPROV_OR_NCRYPT_KEY_HANDLE(0),
+                        None,
                         &subject_blob,
                         CERT_CREATE_SELFSIGN_FLAGS(0),
                         None,
@@ -159,8 +192,51 @@ impl Certificate {
         crate::sys::sha256(&der_bytes)
     }
 
+    #[cfg(test)]
     pub fn context(&self) -> *const CERT_CONTEXT {
         self.cert_context
+    }
+
+    /// Export the private key in PKCS#8 DER format.
+    ///
+    /// Only available when the certificate was created via `new_self_signed`
+    /// with a key handle (EC-DSA keys).
+    pub fn export_private_key_pkcs8_der(&self) -> Result<Vec<u8>, WinCryptoError> {
+        use windows::Win32::Security::Cryptography::NCRYPT_PKCS8_PRIVATE_KEY_BLOB;
+        use windows::Win32::Security::Cryptography::NCryptExportKey;
+        let key_handle = self
+            .key_handle
+            .ok_or_else(|| WinCryptoError::Generic("No private key handle available".into()))?;
+
+        // SAFETY: NCryptExportKey borrows the key handle and output buffer for
+        // the duration of each call; both outlive this block.
+        unsafe {
+            // Query the required buffer size.
+            let mut size = 0u32;
+            NCryptExportKey(
+                key_handle,
+                None,
+                NCRYPT_PKCS8_PRIVATE_KEY_BLOB,
+                None,
+                None,
+                &mut size,
+                NCRYPT_SILENT_FLAG,
+            )?;
+
+            let mut buf = vec![0u8; size as usize];
+            NCryptExportKey(
+                key_handle,
+                None,
+                NCRYPT_PKCS8_PRIVATE_KEY_BLOB,
+                None,
+                Some(&mut buf),
+                &mut size,
+                NCRYPT_SILENT_FLAG,
+            )?;
+
+            buf.truncate(size as usize);
+            Ok(buf)
+        }
     }
 }
 
@@ -189,9 +265,11 @@ impl Drop for Certificate {
 #[cfg(test)]
 mod tests {
     use std::ffi::CStr;
-    use windows::Win32::Security::Cryptography::{
-        szOID_ECC_PUBLIC_KEY, szOID_RSA_RSA, CertNameToStrA, CERT_X500_NAME_STR, X509_ASN_ENCODING,
-    };
+    use windows::Win32::Security::Cryptography::CERT_X500_NAME_STR;
+    use windows::Win32::Security::Cryptography::CertNameToStrA;
+    use windows::Win32::Security::Cryptography::X509_ASN_ENCODING;
+    use windows::Win32::Security::Cryptography::szOID_ECC_PUBLIC_KEY;
+    use windows::Win32::Security::Cryptography::szOID_RSA_RSA;
 
     #[test]
     fn verify_self_signed_rsa() {
@@ -310,5 +388,24 @@ mod tests {
         let cert = super::Certificate::new_self_signed(true, "cn=WebRTC").unwrap();
         let fingerprint = cert.sha256_fingerprint().unwrap();
         assert_eq!(fingerprint.len(), 32);
+    }
+}
+
+#[cfg(test)]
+mod dimpl_tests {
+    #[test]
+    fn export_pkcs8_ec_dsa() {
+        let cert = super::Certificate::new_self_signed(true, "cn=WebRTC-PKCS8").unwrap();
+        let pkcs8 = cert.export_private_key_pkcs8_der().unwrap();
+        // PKCS#8 DER starts with a SEQUENCE tag (0x30).
+        assert_eq!(pkcs8[0], 0x30);
+        assert!(!pkcs8.is_empty());
+    }
+
+    #[test]
+    fn export_pkcs8_no_key_handle() {
+        let cert = super::Certificate::new_self_signed(false, "cn=WebRTC-RSA").unwrap();
+        // RSA path doesn't store a key_handle, so export should fail.
+        assert!(cert.export_private_key_pkcs8_der().is_err());
     }
 }

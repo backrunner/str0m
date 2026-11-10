@@ -1,6 +1,6 @@
+use super::CodecExtra;
 use super::contiguity_vp8::Vp8Contiguity;
 use super::contiguity_vp9::Vp9Contiguity;
-use super::CodecExtra;
 
 #[derive(Debug)]
 pub enum Contiguity {
@@ -39,6 +39,7 @@ impl FrameContiguityState {
         picture_id: Option<u64>,
         tl0_picture_id: Option<u64>,
         layer_index: Option<u64>,
+        is_keyframe: bool,
         contiguous_seq: bool,
     ) -> (bool, bool) {
         let Some(picture_id) = picture_id else {
@@ -57,6 +58,14 @@ impl FrameContiguityState {
             self.last_picture_id = Some(picture_id);
             return (true, true);
         };
+
+        // A new encoder can keep the SSRC while restarting picture IDs. A keyframe
+        // is independently decodable, so it can establish a fresh baseline.
+        if is_keyframe && picture_id <= last_picture_id {
+            self.last_tl0_picture_id = Some(tl0_picture_id);
+            self.last_picture_id = Some(picture_id);
+            return (true, false);
+        }
 
         // discard older pictures if any
         if picture_id <= last_picture_id {
@@ -93,7 +102,9 @@ impl FrameContiguityState {
             self.last_picture_id = Some(picture_id);
             if !contiguous_seq {
                 // this as happened in Safari + very lossy network (very rare)
-                debug!("VP8 or VP9: contiguous pictures implies contiguous seq numbers: encoding issue ?")
+                debug!(
+                    "VP8 or VP9: contiguous pictures implies contiguous seq numbers: encoding issue ?"
+                )
             }
         }
 

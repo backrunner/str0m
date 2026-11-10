@@ -4,8 +4,8 @@ use std::str::from_utf8;
 
 use serde::{Deserialize, Serialize};
 
-use crate::io::Id;
-use crate::util::NonCryptographicRng;
+use str0m_proto::Id;
+use str0m_proto::NonCryptographicRng;
 
 macro_rules! str_id {
     ($id:ident, $name:literal, $num:tt, $new_len:tt) => {
@@ -196,6 +196,9 @@ num_id!(SessionId, u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct SeqNo(u64);
 num_id!(SeqNo, u64);
+
+#[cfg(feature = "drv")]
+crate::drv_identity_copy!(Mid, Rid, Ssrc, Pt, SessionId, SeqNo);
 
 /// TWCC-specific sequence number.
 ///

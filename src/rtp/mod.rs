@@ -2,9 +2,12 @@ mod id;
 pub(crate) use id::MidRid;
 pub use id::{Mid, Pt, Rid, SeqNo, SessionId, Ssrc, TwccClusterId, TwccSeq};
 
+mod seq_no_window;
+pub(crate) use seq_no_window::SeqNoWindow;
+
 mod ext;
+pub use ext::{AbsCaptureTime, UserExtensionValues, VideoOrientation};
 pub use ext::{Extension, ExtensionMap, ExtensionSerializer, ExtensionValues};
-pub use ext::{UserExtensionValues, VideoOrientation};
 
 mod dir;
 pub use dir::Direction;
@@ -15,7 +18,7 @@ pub use mtime::MediaTime;
 
 mod header;
 pub use header::RtpHeader;
-pub(crate) use header::{extend_u15, extend_u16, extend_u32, extend_u7, extend_u8};
+pub(crate) use header::{extend_u7, extend_u8, extend_u15, extend_u16, extend_u32};
 
 mod srtp;
 pub(crate) use srtp::SrtpContext;

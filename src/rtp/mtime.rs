@@ -48,6 +48,14 @@ impl Frequency {
     /// Cycles in a second of a 48 kHz signal.
     pub const FORTY_EIGHT_KHZ: Frequency = Self::make(48_000);
 
+    /// Cycles in a second of a 16 kHz signal.
+    ///
+    /// This is the nominal codec clock rate for G722 and the RTP clock rate for
+    /// AMR-WB. G722 samples at 16 kHz but its RTP clock rate is 8000 Hz
+    /// (RFC 3551 §4.5.2). See
+    /// <https://en.wikipedia.org/wiki/RTP_payload_formats#cite_note-55>
+    pub const SIXTEEN_KHZ: Frequency = Self::make(16_000);
+
     /// Cycles in a second of a 8000 Hz signal.
     pub const EIGHT_KHZ: Frequency = Self::make(8_000);
 
@@ -264,7 +272,7 @@ impl MediaTime {
 
     #[inline(always)]
     fn same_base(t0: MediaTime, t1: MediaTime) -> (MediaTime, MediaTime) {
-        let max = Frequency(t0.1 .0.max(t1.1 .0));
+        let max = Frequency(t0.1.0.max(t1.1.0));
         (t0.rebase(max), t1.rebase(max))
     }
 
@@ -331,6 +339,9 @@ impl PartialEq for MediaTime {
     }
 }
 impl Eq for MediaTime {}
+
+#[cfg(feature = "drv")]
+crate::drv_identity_copy!(Frequency, MediaTime);
 
 impl PartialOrd for MediaTime {
     #[inline(always)]

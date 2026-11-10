@@ -10,7 +10,6 @@ mod hash;
 mod hmac;
 mod kx_group;
 mod sign;
-mod tls12;
 
 use dimpl::crypto::{CryptoProvider, SecureRandom};
 
@@ -18,12 +17,12 @@ use dimpl::crypto::{CryptoProvider, SecureRandom};
 pub fn default_provider() -> CryptoProvider {
     CryptoProvider {
         cipher_suites: cipher_suite::ALL_CIPHER_SUITES,
+        dtls13_cipher_suites: cipher_suite::ALL_DTLS13_CIPHER_SUITES,
         kx_groups: kx_group::ALL_KX_GROUPS,
         signature_verification: &sign::SIGNATURE_VERIFIER,
         key_provider: &sign::KEY_PROVIDER,
         secure_random: &SECURE_RANDOM,
         hash_provider: &hash::HASH_PROVIDER,
-        prf_provider: &tls12::PRF_PROVIDER,
         hmac_provider: &hmac::HMAC_PROVIDER,
     }
 }
@@ -32,11 +31,11 @@ pub fn default_provider() -> CryptoProvider {
 struct AppleSecureRandom;
 
 impl SecureRandom for AppleSecureRandom {
-    fn fill(&self, buf: &mut [u8]) -> Result<(), String> {
+    fn fill(&self, buf: &mut [u8]) -> Result<(), dimpl::CryptoError> {
         use security_framework::random::SecRandom;
         let rng = SecRandom::default();
         rng.copy_bytes(buf)
-            .map_err(|_| "Failed to generate random bytes".to_string())
+            .map_err(|_| dimpl::CryptoError::OperationFailed(dimpl::CryptoOperation::FillRandom))
     }
 }
 

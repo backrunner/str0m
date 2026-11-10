@@ -154,8 +154,10 @@ impl Dlrr {
         buf[0] = 5_u8;
         // reserved;
         buf[1] = 0_u8;
-        // block length
-        let len: u16 = self.items.len() as u16 * 12_u16;
+        // block length, in 32-bit words (RFC 3611 §3): each DLRR sub-block is 3 words
+        // (ssrc + last_rr + delay = 12 bytes). Must match the parser, which divides this
+        // field by 3 to recover the item count.
+        let len: u16 = self.items.len() as u16 * 3_u16;
         buf[2..4].copy_from_slice(&len.to_be_bytes());
 
         let mut buf = &mut buf[4..];
@@ -164,7 +166,8 @@ impl Dlrr {
             buf[0..4].copy_from_slice(&item.ssrc.to_be_bytes());
             buf[4..8].copy_from_slice(&item.last_rr_time.to_be_bytes());
             buf[8..12].copy_from_slice(&item.last_rr_delay.to_be_bytes());
-            buf = &mut buf[4..];
+            // advance past the full 12-byte sub-block
+            buf = &mut buf[12..];
         }
 
         self.len()
@@ -192,6 +195,12 @@ impl<'a> TryFrom<&'a [u8]> for ExtendedReport {
             let block: ReportBlock = block;
             let len = block.len();
             blocks.push(block);
+            // A block's reported len may exceed the remaining bytes for a
+            // truncated/malformed packet. Guard against slicing past the end
+            // (panic) and against a zero len that would spin forever.
+            if len == 0 || len >= buf.len() {
+                break;
+            }
             buf = &buf[len..];
         }
 
@@ -226,6 +235,10 @@ impl<'a> TryFrom<&'a [u8]> for Rrtr {
     type Error = &'static str;
 
     fn try_from(buf: &'a [u8]) -> Result<Self, Self::Error> {
+        if buf.len() < 12 {
+            return Err("Less than 12 bytes for Rrtr");
+        }
+
         let ntp_time = u64::from_be_bytes(buf[4..4 + 8].try_into().unwrap());
         let ntp_time = SystemTime::from_ntp_64(ntp_time);
 
@@ -237,6 +250,10 @@ impl<'a> TryFrom<&'a [u8]> for Dlrr {
     type Error = &'static str;
 
     fn try_from(buf: &'a [u8]) -> Result<Self, Self::Error> {
+        if buf.len() < 4 {
+            return Err("Less than 4 bytes for Dlrr");
+        }
+
         let words_per_block = 3;
         let blocks = u16::from_be_bytes(buf[2..4].try_into().unwrap()) / words_per_block;
 
@@ -246,6 +263,12 @@ impl<'a> TryFrom<&'a [u8]> for Dlrr {
         let mut buf = &buf[4..];
 
         for _ in 0..blocks {
+            // Each DLRR item is 12 bytes. The block count comes from the
+            // (attacker-controlled) length field, so stop if there aren't
+            // enough bytes left for another item.
+            if buf.len() < 12 {
+                break;
+            }
             let ssrc = u32::from_be_bytes(buf[0..4].try_into().unwrap()).into();
             let last_rr_time = u32::from_be_bytes(buf[4..8].try_into().unwrap());
             let last_rr_delay = u32::from_be_bytes(buf[8..12].try_into().unwrap());

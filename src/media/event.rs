@@ -1,9 +1,10 @@
 use std::fmt;
 use std::ops::RangeInclusive;
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::packet::MediaKind;
-use crate::rtp_::{Direction, ExtensionValues, MediaTime, Mid, Pt, Rid, SenderInfo, SeqNo};
+use crate::rtp_::{Direction, ExtensionValues, MediaTime, Mid, Pt, Rid, SenderInfo, SeqNo, Ssrc};
 use crate::sdp::SimulcastLayer as SdpSimulcastLayer;
 use crate::sdp::{RestrictionId, Simulcast as SdpSimulcast, SimulcastGroups as SdpSimulcastGroups};
 
@@ -104,7 +105,7 @@ impl Simulcast {
 
     /// Add a receive layer
     pub fn add_recv_layer(&mut self, layer: SimulcastLayer) {
-        self.send.push(layer);
+        self.recv.push(layer);
     }
 }
 
@@ -261,7 +262,7 @@ pub struct MediaData {
     /// transmission units into smaller parts.
     ///
     /// This data is a full depayloaded Frame.
-    pub data: Vec<u8>,
+    pub data: Arc<[u8]>,
 
     /// RTP header extensions for this media data. This is taken from the
     /// first RTP header.
@@ -278,7 +279,8 @@ pub struct MediaData {
     /// First packet of a talkspurt, that is the first packet after a silence period during
     /// which packets have not been transmitted contiguously.
     ///
-    /// For audio only when dtx or silence suppression is enabled.
+    /// For audio only when dtx or silence suppression is enabled. For telephone events, the first
+    /// packet of an event.
     pub audio_start_of_talk_spurt: bool,
 }
 
@@ -287,8 +289,10 @@ impl MediaData {
     pub fn is_keyframe(&self) -> bool {
         match self.codec_extra {
             CodecExtra::None => false,
+            CodecExtra::Tele(_) => false,
             CodecExtra::H264(h264_extra) => h264_extra.is_keyframe,
             CodecExtra::H265(h265_extra) => h265_extra.is_keyframe,
+            CodecExtra::H266(h266_extra) => h266_extra.is_keyframe,
             CodecExtra::Vp8(vp8_extra) => vp8_extra.is_keyframe,
             CodecExtra::Vp9(vp9_extra) => vp9_extra.is_keyframe,
             CodecExtra::Av1(av1_extra) => av1_extra.is_keyframe,
@@ -323,6 +327,20 @@ pub enum KeyframeRequestKind {
     /// Full Intra Request (FIR) is a more severe keyframe request that should only
     /// be used when it's impossible for an end peer to show a video stream.
     Fir,
+}
+
+/// Incoming application-specific Payload-Specific Feedback (PSFB FMT=15, PT=206).
+///
+/// Emitted when a non-REMB FMT=15 RTCP PSFB message is received. The payload
+/// is opaque and application-defined (RFC 4585 Section 6.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppSpecificFeedback {
+    /// SSRC of the sender of this feedback message.
+    pub sender_ssrc: Ssrc,
+    /// SSRC of the media source this feedback relates to.
+    pub media_ssrc: Ssrc,
+    /// Application-dependent payload.
+    pub payload: Arc<[u8]>,
 }
 
 /// Incoming feedback from a sender.

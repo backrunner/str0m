@@ -5,13 +5,13 @@ use std::fmt;
 
 // Re-export all error types for convenience
 pub use crate::crypto::DtlsError;
-pub use crate::ice_::IceError;
 pub use crate::io::NetError;
-pub use crate::packet::PacketError;
+pub use crate::packet::{PacketError, Vp8DescriptorError, Vp8PatchError};
 pub use crate::rtp_::RtpError;
 pub use crate::sctp::ProtoError;
 pub use crate::sctp::SctpError;
 pub use crate::sdp::SdpError;
+pub use is::IceError;
 
 use crate::{Direction, KeyframeRequestKind, Mid, Pt, Rid};
 
@@ -34,7 +34,7 @@ pub enum RtcError {
     /// DTLS errors
     Dtls(DtlsError),
 
-    /// RTP packetization error
+    /// RTP packetization, depacketization, or payload validation error.
     Packet(Mid, Pt, PacketError),
 
     /// The PT attempted to write to is not known.

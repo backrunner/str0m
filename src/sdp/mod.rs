@@ -1,16 +1,15 @@
 use std::fmt;
 use std::ops::Deref;
 
-use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 mod data;
+#[cfg(test)]
+pub(crate) use data::RtpMap;
+pub(crate) use data::is_no_stream;
 pub(crate) use data::{FormatParam, Sdp, Session, SessionAttribute, Setup};
 pub(crate) use data::{MediaAttribute, MediaLine, MediaType, Msid, Proto};
 pub(crate) use data::{RestrictionId, Simulcast, SimulcastGroups, SimulcastLayer};
-pub(crate) use parser::parse_candidate;
-
-#[cfg(test)]
-pub(crate) use data::RtpMap;
 
 mod parser;
 
@@ -151,8 +150,8 @@ sdp_ser!(SdpAnswer, "Answer", "answer");
 
 #[cfg(test)]
 mod test {
-    use crate::rtp_::SessionId;
     use crate::VERSION;
+    use crate::rtp_::SessionId;
 
     use super::*;
 
@@ -172,7 +171,12 @@ mod test {
         let offer = SdpOffer(sdp());
         let json = serde_json::to_string(&offer).unwrap();
 
-        assert_eq!(json, format!("{{\"type\":\"offer\",\"sdp\":\"v=0\\r\\no=str0m-{VERSION} 123 2 IN IP4 0.0.0.0\\r\\ns=-\\r\\nt=0 0\\r\\n\"}}"));
+        let expected = format!(
+            "{{\"type\":\"offer\",\"sdp\":\
+             \"v=0\\r\\no=str0m-{VERSION} 123 2 \
+             IN IP4 0.0.0.0\\r\\ns=-\\r\\nt=0 0\\r\\n\"}}"
+        );
+        assert_eq!(json, expected);
 
         let offer2: SdpOffer = serde_json::from_str(&json).unwrap();
 
@@ -184,7 +188,12 @@ mod test {
         let answer = SdpAnswer(sdp());
         let json = serde_json::to_string(&answer).unwrap();
 
-        assert_eq!(json, format!("{{\"type\":\"answer\",\"sdp\":\"v=0\\r\\no=str0m-{VERSION} 123 2 IN IP4 0.0.0.0\\r\\ns=-\\r\\nt=0 0\\r\\n\"}}"));
+        let expected = format!(
+            "{{\"type\":\"answer\",\"sdp\":\
+             \"v=0\\r\\no=str0m-{VERSION} 123 2 \
+             IN IP4 0.0.0.0\\r\\ns=-\\r\\nt=0 0\\r\\n\"}}"
+        );
+        assert_eq!(json, expected);
 
         let answer2: SdpAnswer = serde_json::from_str(&json).unwrap();
 

@@ -1,87 +1,71 @@
-//! DTLS provider implementation using Windows SChannel.
+//! DTLS implementation using dimpl with Windows CNG as crypto backend.
 
-use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, LazyLock, Mutex};
-use std::time::{Duration, Instant};
-use str0m_proto::crypto::dtls::{DtlsCert, DtlsImplError, DtlsInstance, DtlsOutput, DtlsProvider};
-use str0m_proto::crypto::dtls::{KeyingMaterial, SrtpProfile};
+use std::sync::Arc;
+use std::time::Instant;
+
 use str0m_proto::crypto::CryptoError;
+use str0m_proto::crypto::DtlsVersion;
+use str0m_proto::crypto::dtls::ProtocolVersion;
+use str0m_proto::crypto::dtls::{DtlsCert, DtlsImplError, DtlsInstance, DtlsOutput, DtlsProvider};
 
-use crate::sys::{Certificate, Dtls, DtlsEvent};
+use dimpl::{Config, Dtls, DtlsCertificate};
 
-/// Cache for Windows certificates, keyed by their DER bytes.
-/// This ensures the same Windows certificate handle is used for both
-/// fingerprint generation and DTLS handshake, even when multiple Rtc
-/// instances are created in parallel.
-static CERT_CACHE: LazyLock<Mutex<HashMap<Vec<u8>, Arc<Certificate>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+// ============================================================================
+// DTLS Provider Implementation
+// ============================================================================
 
 #[derive(Debug)]
-pub(super) struct WinCryptoDtlsProvider;
+pub(crate) struct WinCryptoDtlsProvider;
 
 impl DtlsProvider for WinCryptoDtlsProvider {
     fn generate_certificate(&self) -> Option<DtlsCert> {
-        let cert = Certificate::new_self_signed(true, "CN=WebRTC").ok()?;
-        let cert = Arc::new(cert);
+        generate_certificate_impl().ok()
+    }
 
-        // Get the DER bytes from the certificate
-        let der_bytes = cert.get_der_bytes().ok()?;
+    fn new_dtls(
+        &self,
+        cert: &DtlsCert,
+        now: Instant,
+        dtls_version: DtlsVersion,
+        mtu: Option<usize>,
+    ) -> Result<Box<dyn DtlsInstance>, CryptoError> {
+        let dimpl_cert = DtlsCertificate {
+            certificate: cert.certificate.clone(),
+            private_key: cert.private_key.clone(),
+        };
 
-        // Cache the certificate for later use in new_dtls, keyed by DER bytes
-        if let Ok(mut cache) = CERT_CACHE.lock() {
-            cache.insert(der_bytes.clone(), Arc::clone(&cert));
+        // ICE verifies return routability before DTLS, making server cookies redundant.
+        let mut builder = Config::builder().use_server_cookie(false);
+        if let Some(mtu) = mtu {
+            builder = builder.mtu(mtu);
+        }
+        if self.is_test() {
+            builder = builder.dangerously_set_rng_seed(42);
         }
 
-        Some(DtlsCert {
-            certificate: der_bytes,
-            private_key: vec![], // Private key is managed internally by Windows
-        })
-    }
+        let config = builder
+            .with_crypto_provider(crate::dimpl_provider::default_provider())
+            .build()
+            .map_err(|e| CryptoError::Other(format!("dimpl config creation failed: {e}")))?;
 
-    fn new_dtls(&self, cert: &DtlsCert) -> Result<Box<dyn DtlsInstance>, CryptoError> {
-        // Look up the Windows certificate by its DER bytes
-        let win_cert = CERT_CACHE
-            .lock()
-            .map_err(|e| CryptoError::Other(format!("Failed to lock certificate cache: {}", e)))?
-            .get(&cert.certificate)
-            .cloned()
-            .ok_or_else(|| {
-                CryptoError::Other(
-                    "Certificate not found in cache - was generate_certificate called?".to_string(),
-                )
-            })?;
+        let config = Arc::new(config);
+        let dtls = match dtls_version {
+            DtlsVersion::Dtls12 => Dtls::new_12(config, dimpl_cert, now),
+            DtlsVersion::Dtls13 => Dtls::new_13(config, dimpl_cert, now),
+            DtlsVersion::Auto => Dtls::new_auto(config, dimpl_cert, now),
+            _ => {
+                return Err(CryptoError::Other(format!(
+                    "Unsupported DTLS version: {dtls_version}"
+                )));
+            }
+        };
 
-        let dtls =
-            Dtls::new(win_cert).map_err(|e| CryptoError::Other(format!("DTLS creation: {}", e)))?;
-
-        Ok(Box::new(WinCryptoDtlsInstance {
-            dtls,
-            pending_outputs: VecDeque::new(),
-            queued_app_data: VecDeque::new(),
-            last_timeout: None,
-        }))
+        Ok(Box::new(WinCryptoDtlsInstance { dtls }))
     }
 }
-
-// ============================================================================
-// DTLS Instance Wrapper
-// ============================================================================
 
 struct WinCryptoDtlsInstance {
     dtls: Dtls,
-    pending_outputs: VecDeque<PendingOutput>,
-    /// Application data queued before handshake completes.
-    queued_app_data: VecDeque<Vec<u8>>,
-    /// The last time we were given via handle_timeout, used for calculating next timeout.
-    last_timeout: Option<Instant>,
-}
-
-#[derive(Debug)]
-enum PendingOutput {
-    Connected,
-    PeerCert(Vec<u8>),
-    KeyingMaterial(KeyingMaterial, SrtpProfile),
-    ApplicationData(Vec<u8>),
 }
 
 impl std::fmt::Debug for WinCryptoDtlsInstance {
@@ -90,143 +74,76 @@ impl std::fmt::Debug for WinCryptoDtlsInstance {
     }
 }
 
-impl WinCryptoDtlsInstance {
-    fn process_dtls_event(&mut self, event: DtlsEvent) {
-        match event {
-            DtlsEvent::Connected {
-                srtp_profile_id,
-                srtp_keying_material,
-                peer_cert_der,
-            } => {
-                let profile = match srtp_profile_id {
-                    0x0001 => SrtpProfile::Aes128CmSha1_80,
-                    0x0007 => SrtpProfile::AeadAes128Gcm,
-                    0x0008 => SrtpProfile::AeadAes256Gcm,
-                    _ => return, // Unknown profile, ignore
-                };
-
-                // Queue up the sequence: Connected -> PeerCert -> KeyingMaterial
-                self.pending_outputs.push_back(PendingOutput::Connected);
-                self.pending_outputs
-                    .push_back(PendingOutput::PeerCert(peer_cert_der));
-                self.pending_outputs
-                    .push_back(PendingOutput::KeyingMaterial(
-                        KeyingMaterial::new(&srtp_keying_material),
-                        profile,
-                    ));
-            }
-            DtlsEvent::Data(data) => {
-                self.pending_outputs
-                    .push_back(PendingOutput::ApplicationData(data));
-            }
-            DtlsEvent::None | DtlsEvent::WouldBlock => {
-                // No event to queue
-            }
-        }
-    }
-
-    /// Flush any application data queued before handshake completed.
-    fn flush_queued_app_data(&mut self) -> Result<(), DtlsImplError> {
-        while let Some(queued) = self.queued_app_data.pop_front() {
-            let sent = self
-                .dtls
-                .send_data(&queued)
-                .map_err(|e| DtlsImplError::CryptoError(format!("DTLS send: {}", e)))?;
-            if !sent {
-                // Handshake not complete yet, put data back
-                self.queued_app_data.push_front(queued);
-                break;
-            }
-        }
-        Ok(())
-    }
-}
-
 impl DtlsInstance for WinCryptoDtlsInstance {
     fn set_active(&mut self, active: bool) {
-        self.dtls.set_as_client(active).expect("set_as_client");
+        self.dtls.set_active(active);
     }
 
     fn handle_packet(&mut self, packet: &[u8]) -> Result<(), DtlsImplError> {
-        let event = self
-            .dtls
-            .handle_receive(Some(packet))
-            .map_err(|e| DtlsImplError::CryptoError(format!("DTLS error: {}", e)))?;
-
-        // Store the event for poll_output to retrieve
-        self.process_dtls_event(event);
-
-        // If we just became connected, flush any queued application data
-        if self.dtls.is_connected() {
-            self.flush_queued_app_data()?;
-        }
-
-        Ok(())
+        self.dtls.handle_packet(packet)
     }
 
     fn poll_output<'a>(&mut self, buf: &'a mut [u8]) -> DtlsOutput<'a> {
-        // First check if we have pending outputs from a previous Connected event
-        if let Some(pending) = self.pending_outputs.pop_front() {
-            return match pending {
-                PendingOutput::Connected => DtlsOutput::Connected,
-                PendingOutput::PeerCert(cert) => {
-                    let len = cert.len().min(buf.len());
-                    buf[..len].copy_from_slice(&cert[..len]);
-                    DtlsOutput::PeerCert(&buf[..len])
-                }
-                PendingOutput::KeyingMaterial(km, profile) => {
-                    DtlsOutput::KeyingMaterial(km, profile)
-                }
-                PendingOutput::ApplicationData(data) => {
-                    let len = data.len().min(buf.len());
-                    buf[..len].copy_from_slice(&data[..len]);
-                    DtlsOutput::ApplicationData(&buf[..len])
-                }
-            };
-        }
-
-        // Poll for datagram first
-        if let Some(datagram) = self.dtls.pull_datagram() {
-            let len = datagram.len().min(buf.len());
-            buf[..len].copy_from_slice(&datagram[..len]);
-            return DtlsOutput::Packet(&buf[..len]);
-        }
-
-        fn not_happening() -> Instant {
-            Instant::now() + Duration::from_secs(3600 * 24 * 365 * 10)
-        }
-
-        // Return timeout based on last known time. If we don't have one yet,
-        // return a far-future time until handle_timeout is called.
-        let base_time = self.last_timeout.unwrap_or_else(not_happening);
-        DtlsOutput::Timeout(base_time + std::time::Duration::from_millis(100))
+        self.dtls.poll_output(buf)
     }
 
     fn handle_timeout(&mut self, now: Instant) -> Result<(), DtlsImplError> {
-        self.last_timeout = Some(now);
-        // SChannel handles DTLS retransmissions internally, so we don't need to do anything here.
-        // The handshake is driven by handle_packet receiving data from the peer.
-        Ok(())
+        self.dtls.handle_timeout(now)
     }
 
-    fn send_application_data(&mut self, data: &[u8]) -> Result<(), DtlsImplError> {
-        // If handshake not complete, queue for later
-        if !self.dtls.is_connected() {
-            self.queued_app_data.push_back(data.to_vec());
-            return Ok(());
-        }
-
-        // Flush any queued data first
-        self.flush_queued_app_data()?;
-
-        // Now send current data
-        self.dtls
-            .send_data(data)
-            .map_err(|e| DtlsImplError::CryptoError(format!("DTLS send: {}", e)))?;
-        Ok(())
+    fn send_application_data(&mut self, data: &[u8]) -> Result<usize, DtlsImplError> {
+        self.dtls.send_application_data(data)
     }
 
     fn is_active(&self) -> bool {
-        self.dtls.is_client().unwrap_or(false)
+        self.dtls.is_active()
+    }
+
+    fn protocol_version(&self) -> Option<ProtocolVersion> {
+        self.dtls.protocol_version()
+    }
+
+    fn is_closing(&self) -> bool {
+        self.dtls.is_closing()
+    }
+
+    fn is_closed(&self) -> bool {
+        self.dtls.is_closed()
+    }
+
+    fn close(&mut self) -> Result<(), DtlsImplError> {
+        self.dtls.close()
+    }
+}
+
+// ============================================================================
+// Certificate Generation
+// ============================================================================
+
+fn generate_certificate_impl() -> Result<DtlsCert, CryptoError> {
+    let cert = crate::sys::Certificate::new_self_signed(true, "cn=WebRTC").map_err(|e| {
+        CryptoError::Other(format!("Failed to create self-signed certificate: {e}"))
+    })?;
+
+    let certificate = cert
+        .get_der_bytes()
+        .map_err(|e| CryptoError::Other(format!("Failed to get certificate DER bytes: {e}")))?;
+
+    let private_key_der = cert
+        .export_private_key_pkcs8_der()
+        .map_err(|e| CryptoError::Other(format!("Failed to export private key as PKCS#8: {e}")))?;
+
+    Ok(DtlsCert {
+        certificate,
+        private_key: private_key_der,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn generate_self_signed_certificate() {
+        let cert = super::generate_certificate_impl().unwrap();
+        assert_eq!(165, cert.private_key.len());
     }
 }

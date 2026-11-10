@@ -1,8 +1,8 @@
 use std::time::Instant;
 
+use crate::Reason;
 use crate::bwe_::ProbeClusterConfig;
 use crate::rtp_::{Bitrate, DataSize, MidRid, TwccClusterId};
-use crate::Reason;
 
 mod control;
 pub(crate) use control::PacerControl;
@@ -37,6 +37,13 @@ impl PacerImpl {
                 // NullPacer doesn't support probing
             }
             PacerImpl::LeakyBucket(v) => v.start_probe(config),
+        }
+    }
+
+    pub fn active_cluster(&self) -> Option<TwccClusterId> {
+        match self {
+            PacerImpl::Null(_) => None,
+            PacerImpl::LeakyBucket(v) => v.active_cluster(),
         }
     }
 
@@ -94,13 +101,6 @@ impl Pacer for PacerImpl {
             PacerImpl::LeakyBucket(v) => v.register_send(now, packet_size, from),
         }
     }
-
-    fn has_padding_queue(&self) -> bool {
-        match self {
-            PacerImpl::Null(v) => v.has_padding_queue(),
-            PacerImpl::LeakyBucket(v) => v.has_padding_queue(),
-        }
-    }
 }
 
 /// A packet Pacer.
@@ -134,9 +134,6 @@ pub trait Pacer {
     ///
     /// **MUST** be called each time [`Pacer::poll_queue`] produces a mid.
     fn register_send(&mut self, now: Instant, packet_size: DataSize, from: MidRid);
-
-    /// Whether we have a queue for padding.
-    fn has_padding_queue(&self) -> bool;
 }
 
 /// The sub-reason for the [`Reason::Pacer`][crate::Reason::Pacer].

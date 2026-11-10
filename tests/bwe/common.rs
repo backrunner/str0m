@@ -11,7 +11,7 @@ use str0m::bwe::{Bitrate, BweKind};
 use str0m::format::Codec;
 use str0m::media::MediaKind;
 use str0m::media::Pt;
-use str0m::rtp::{ExtensionValues, Ssrc};
+use str0m::rtp::{RtpWrite, Ssrc};
 use str0m::{Event, Rtc, RtcError};
 use tracing::info;
 
@@ -33,7 +33,7 @@ pub fn connect_with_bwe(initial_bitrate: Bitrate, desired_bitrate: Bitrate) -> (
 
     let (mut l, mut r) = connect_l_r_with_rtc(rtc1, rtc2);
 
-    l.bwe().set_desired_bitrate(desired_bitrate);
+    l.bwe().set_bitrate(Bitrate::ZERO, desired_bitrate);
 
     // The resolution must be smaller than the fastest send rate we want to test.
     l.set_forced_time_advance(Duration::from_micros(100));
@@ -54,13 +54,16 @@ pub fn get_last_bwe_estimate(rtc: &TestRtc) -> Option<Bitrate> {
     rtc.events
         .iter()
         .filter_map(|(_, e)| {
-            if let Event::EgressBitrateEstimate(BweKind::Twcc(bitrate)) = e {
-                Some(bitrate)
+            let Event::EgressBitrateEstimate(kind) = e else {
+                return None;
+            };
+            if let BweKind::Twcc { estimate, .. } = kind {
+                Some(estimate)
             } else {
                 None
             }
         })
-        .last()
+        .next_back()
         .copied()
 }
 
@@ -74,6 +77,8 @@ pub struct BweTestContext {
     /// Accumulated byte budget for sending (smooths out timing variations)
     byte_budget: f64,
 }
+
+type ProbeCheck = Arc<dyn Fn(usize, &ProbeClusterConfig) -> bool>;
 
 #[derive(Clone)]
 pub enum Step {
@@ -100,7 +105,7 @@ pub enum Step {
     },
     CheckProbe {
         description: &'static str,
-        check: Arc<dyn Fn(usize, &ProbeClusterConfig) -> bool>,
+        check: ProbeCheck,
     },
     /// Assert no probes fired since last event_offset update
     AssertNoProbes { description: &'static str },
@@ -170,7 +175,7 @@ impl BweTestContext {
                     media_send_rate,
                 } => {
                     info!("{}/{}: Media rates: {}", no + 1, total, description);
-                    l.bwe().set_desired_bitrate(*desired_bitrate);
+                    l.bwe().set_bitrate(Bitrate::ZERO, *desired_bitrate);
                     self.set_media_send_rate(*media_send_rate);
                     event_offset = l.events.len();
                 }
@@ -300,22 +305,12 @@ impl BweTestContext {
                 let mut direct = l.direct_api();
                 let stream = direct.stream_tx(&self.ssrc).unwrap();
 
-                let exts = ExtensionValues::default();
-
                 // Send a video packet
                 let payload = vec![0u8; packet_size];
-                stream
-                    .write_rtp(
-                        self.pt,
-                        self.seq_no.into(),
-                        time,
-                        wallclock,
-                        false,
-                        exts,
-                        true,
-                        payload,
-                    )
-                    .expect("clean write");
+                stream.write_rtp(
+                    RtpWrite::new(self.pt, self.seq_no.into(), time, wallclock, payload)
+                        .nackable(true),
+                );
 
                 self.seq_no += 1;
                 self.byte_budget -= packet_size as f64;

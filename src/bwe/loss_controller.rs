@@ -29,8 +29,8 @@ use super::time::{TimeDelta, Timestamp};
 ///
 ///
 /// Ref:
-/// * https://webrtc.googlesource.com/src/+/refs/heads/main/modules/congestion_controller/goog_cc/loss_based_bwe_v2.cc
-/// * https://webrtc.googlesource.com/src/+/refs/heads/main/modules/congestion_controller/goog_cc/loss_based_bwe_v2.h
+/// * https://webrtc.googlesource.com/src/+/main/modules/congestion_controller/goog_cc/loss_based_bwe_v2.cc
+/// * https://webrtc.googlesource.com/src/+/main/modules/congestion_controller/goog_cc/loss_based_bwe_v2.h
 pub struct LossController {
     /// Configuration for the controller.
     config: Config,
@@ -189,8 +189,7 @@ impl LossController {
             self.reset_observations();
             trace!(
                 "LossController: ALR state changed (was: {}, now: {}), observations reset",
-                was_in_alr,
-                is_in_alr
+                was_in_alr, is_in_alr
             );
         }
 
@@ -1423,8 +1422,10 @@ mod test {
             let estimate = bandwidth_estimate.expect("Should have an estimate");
             assert!(
                 estimate > loss_limited && estimate <= Bitrate::mbps(1),
-                "During the recovery window after a loss spike the estimate should increase, but be bounded. loss_limited={}, estimate={}, expected <= 1 Mbps",
-                loss_limited, estimate
+                "During the recovery window after a loss spike the estimate should increase, \
+                    but be bounded. loss_limited={}, estimate={}, expected <= 1 Mbps",
+                loss_limited,
+                estimate
             );
             assert_eq!(state, LossControllerState::Decreasing);
         }
@@ -1444,7 +1445,8 @@ mod test {
             let estimate = bandwidth_estimate.expect("Should have an estimate");
             assert!(
                 estimate == Bitrate::bps(1_000_000),
-                "Eventually the estimate should recover but still remain bounded until the average loss caused by spike ages out"
+                "Eventually the estimate should recover but still remain bounded until the \
+                    average loss caused by spike ages out"
             );
             assert_eq!(state, LossControllerState::Decreasing);
         }

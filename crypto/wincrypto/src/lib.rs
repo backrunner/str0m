@@ -1,18 +1,19 @@
-//! Windows SChannel + CNG implementation of cryptographic functions.
-//! DTLS via Windows SChannel.
+//! Windows CNG implementation of cryptographic functions.
+//! DTLS 1.2 and 1.3 via dimpl.
 
-#[macro_use]
-extern crate tracing;
+// Avoid rewriting existing code: nested conditions are often more readable than long if-chains.
+#![allow(clippy::collapsible_if)]
 
 mod srtp;
 use srtp::WinCryptoSrtpProvider;
 
 mod sha1;
-use sha1::WinCryptoSha1HmacProvider;
+use sha1::{WinCryptoSha1HmacProvider, WinCryptoSha1Provider};
 
 mod sha256;
 use sha256::WinCryptoSha256Provider;
 
+mod dimpl_provider;
 mod dtls;
 use dtls::WinCryptoDtlsProvider;
 
@@ -22,13 +23,13 @@ pub use sys::WinCryptoError;
 
 mod sys;
 
-/// Create the default Windows CNG/SChannel crypto provider.
+/// Create the default Windows CNG crypto provider.
 ///
 /// This provider implements all cryptographic operations required for WebRTC:
-/// - DTLS 1.2 for secure key exchange (using Windows SChannel)
+/// - DTLS 1.2 and 1.3 for secure key exchange (using dimpl + Windows CNG)
 /// - SRTP for encrypted media (using Windows CNG)
 /// - SHA1-HMAC for STUN message integrity (using Windows CNG)
-/// - SHA-256 for certificate fingerprints (using Windows CNG)
+/// - SHA-1 and SHA-256 for certificate fingerprints (using Windows CNG)
 ///
 /// # Example
 ///
@@ -42,13 +43,34 @@ mod sys;
 pub fn default_provider() -> CryptoProvider {
     static SRTP: WinCryptoSrtpProvider = WinCryptoSrtpProvider;
     static SHA1_HMAC: WinCryptoSha1HmacProvider = WinCryptoSha1HmacProvider;
+    static SHA1: WinCryptoSha1Provider = WinCryptoSha1Provider;
     static SHA256: WinCryptoSha256Provider = WinCryptoSha256Provider;
     static DTLS: WinCryptoDtlsProvider = WinCryptoDtlsProvider;
 
     CryptoProvider {
         srtp_provider: &SRTP,
         sha1_hmac_provider: &SHA1_HMAC,
+        sha1_provider: &SHA1,
         sha256_provider: &SHA256,
         dtls_provider: &DTLS,
+    }
+}
+
+/// Create the Windows CNG crypto provider used by the Dimpl DTLS backend.
+///
+/// This allows callers that need non-default Dimpl configuration to construct
+/// `dimpl::Config` directly while retaining the Windows CNG implementation.
+pub fn dimpl_crypto_provider() -> dimpl::crypto::CryptoProvider {
+    dimpl_provider::default_provider()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn exposed_dimpl_provider_builds_config() {
+        dimpl::Config::builder()
+            .with_crypto_provider(super::dimpl_crypto_provider())
+            .build()
+            .expect("Windows CNG Dimpl provider should build a valid config");
     }
 }

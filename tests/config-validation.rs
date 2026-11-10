@@ -8,7 +8,7 @@ use str0m::{Event, RtcConfig, RtcError};
 use tracing::info_span;
 
 mod common;
-use common::{init_crypto_default, init_log, negotiate, progress, Peer, TestRtc};
+use common::{Peer, TestRtc, init_crypto_default, init_log, negotiate, progress};
 
 /// Test set_reordering_size_audio() and set_reordering_size_video() with custom sizes.
 #[test]
@@ -96,6 +96,26 @@ fn config_reordering_size_custom() -> Result<(), RtcError> {
     );
 
     Ok(())
+}
+
+/// Test timeout defaults and configuration round-trips, including large durations.
+#[test]
+fn config_audio_reordering_timeout_custom() {
+    assert_eq!(
+        RtcConfig::new().reordering_timeout_audio(),
+        Some(Duration::from_secs(1))
+    );
+    for timeout in [
+        None,
+        Some(Duration::ZERO),
+        Some(Duration::from_millis(250)),
+        Some(Duration::from_secs(601)),
+        Some(Duration::MAX),
+    ] {
+        let config = RtcConfig::new().set_reordering_timeout_audio(timeout);
+        assert_eq!(config.reordering_timeout_audio(), timeout);
+        assert_eq!(config.clone().reordering_timeout_audio(), timeout);
+    }
 }
 
 /// Test enable_raw_packets(true) produces RawPacket events.
@@ -237,6 +257,43 @@ fn config_stats_interval_custom() -> Result<(), RtcError> {
     Ok(())
 }
 
+#[test]
+fn config_rtcp_report_intervals() {
+    let default_config = RtcConfig::new();
+    assert_eq!(
+        default_config.rtcp_report_interval_audio(),
+        Duration::from_secs(5)
+    );
+    assert_eq!(
+        default_config.rtcp_report_interval_video(),
+        Duration::from_secs(1)
+    );
+
+    let config = RtcConfig::new()
+        .set_rtcp_report_interval_audio(Duration::from_millis(750))
+        .set_rtcp_report_interval_video(Duration::from_millis(500));
+    assert_eq!(
+        config.rtcp_report_interval_audio(),
+        Duration::from_millis(750)
+    );
+    assert_eq!(
+        config.rtcp_report_interval_video(),
+        Duration::from_millis(500)
+    );
+}
+
+#[test]
+#[should_panic]
+fn config_rejects_zero_audio_rtcp_report_interval() {
+    RtcConfig::new().set_rtcp_report_interval_audio(Duration::ZERO);
+}
+
+#[test]
+#[should_panic]
+fn config_rejects_zero_video_rtcp_report_interval() {
+    RtcConfig::new().set_rtcp_report_interval_video(Duration::ZERO);
+}
+
 /// Test set_stats_interval(None) produces no stats events.
 #[test]
 fn config_stats_disabled() -> Result<(), RtcError> {
@@ -311,8 +368,8 @@ fn config_fingerprint_verification_disabled() -> Result<(), RtcError> {
     init_log();
     init_crypto_default();
 
-    use str0m::crypto::Fingerprint;
     use str0m::Candidate;
+    use str0m::crypto::Fingerprint;
 
     // Create RTCs with fingerprint verification DISABLED
     let rtc_l = RtcConfig::new()

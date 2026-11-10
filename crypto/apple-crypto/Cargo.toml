@@ -1,34 +1,37 @@
 [package]
 name = "str0m-apple-crypto"
-version = "0.1.4"
-description = "Apple CommonCrypto/Security framework backend for str0m WebRTC"
-edition = "2021"
+version = "0.7.0"
+description = "Apple CryptoKit/CommonCrypto/Security framework backend for str0m WebRTC"
+edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/algesten/str0m"
 readme = "README.md"
 
 # MSRV
-rust-version = "1.81.0"
+rust-version = "1.89.0"
 
 [dependencies]
-str0m-proto = { version = "0.1.2", path = "../../proto" }
-dimpl = { version = "0.2.4", default-features = false }
+str0m-proto = { workspace = true, features = ["dtls"] }
+dimpl.workspace = true
+time.workspace = true
 
 # Apple platform bindings
-apple-cryptokit-rs = "0.2.1"
 core-foundation = "0.10"
 security-framework = "3.5"
 
 # ASN.1/X.509 parsing for certificate handling
-# Pin der to 0.7.9 to avoid base64ct 1.8 which requires edition 2024
-der = "=0.7.9"
-pkcs8 = { version = "0.10", features = ["pem"] }
-sec1 = "0.7"
-spki = "0.7"
-x509-cert = { version = "0.2", default-features = false }
+der.workspace = true
+pkcs8.workspace = true
+sec1.workspace = true
+spki.workspace = true
+x509-cert.workspace = true
 
 # Constant-time comparison for crypto
-subtle = "2.0.0"
+subtle.workspace = true
+
+[build-dependencies]
+sha2.workspace = true
+swift-rs = { version = "1.0.9", features = ["build"] }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

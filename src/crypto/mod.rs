@@ -2,7 +2,7 @@ use str0m_proto::crypto as provider;
 
 pub use provider::{AeadAes128Gcm, AeadAes128GcmCipher, AeadAes256Gcm, AeadAes256GcmCipher};
 pub use provider::{Aes128CmSha1_80, Aes128CmSha1_80Cipher, CryptoProvider, CryptoSafe};
-pub use provider::{Sha1HmacProvider, Sha256Provider};
+pub use provider::{Sha1HmacProvider, Sha1Provider, Sha256Provider};
 pub use provider::{SrtpProvider, SupportedAeadAes128Gcm};
 pub use provider::{SupportedAeadAes256Gcm, SupportedAes128CmSha1_80};
 
@@ -12,8 +12,10 @@ pub mod dtls {
 
     pub use dimpl::DtlsCertificate as DtlsCert;
     pub use dimpl::KeyingMaterial;
+    pub use dimpl::ProtocolVersion;
     pub use dimpl::SrtpProfile;
     // Note: dimpl::Error is renamed to DtlsImplError to avoid conflict with str0m's DtlsError
+    pub use super::provider::DtlsVersion;
     pub use dimpl::{Error as DtlsImplError, Output as DtlsOutput};
 }
 
@@ -39,7 +41,7 @@ pub fn from_feature_flags() -> CryptoProvider {
     #[cfg(feature = "rust-crypto")]
     return str0m_rust_crypto::default_provider();
 
-    #[cfg(feature = "openssl")]
+    #[cfg(any(feature = "openssl", feature = "openssl-dimpl"))]
     return str0m_openssl::default_provider();
 
     #[cfg(all(feature = "apple-crypto", target_vendor = "apple"))]
@@ -50,7 +52,8 @@ pub fn from_feature_flags() -> CryptoProvider {
 
     panic!(
         "No crypto provider available. Enable one of: aws-lc-rs, 
-             rust-crypto, openssl, wincrypto (Windows only), or use str0m-apple-crypto crate"
+             rust-crypto, openssl, openssl-dimpl, wincrypto (Windows only)
+             or use str0m-apple-crypto crate"
     );
 }
 

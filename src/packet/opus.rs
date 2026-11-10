@@ -31,6 +31,14 @@ impl Packetizer for OpusPacketizer {
         // TODO: dtx
         false
     }
+
+    fn marks_talkspurt(&self) -> bool {
+        true
+    }
+
+    fn nackable(&self) -> bool {
+        false
+    }
 }
 
 /// Depacketizes Opus RTP packets.
@@ -126,6 +134,24 @@ mod test {
             "All OPUS RTP packet should be the head of a new partition"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn packetize_respects_mtu() -> Result<(), PacketError> {
+        let payload = vec![0xABu8; 2000];
+        for &mtu in &[100usize, 300, 600, 1200] {
+            let mut pck = OpusPacketizer;
+            let pkts = pck.packetize(mtu, &payload)?;
+            assert!(!pkts.is_empty(), "Opus produced no packets at mtu {mtu}");
+            for (i, pkt) in pkts.iter().enumerate() {
+                assert!(
+                    pkt.len() <= mtu,
+                    "Opus packet {i} size {} > mtu {mtu}",
+                    pkt.len()
+                );
+            }
+        }
         Ok(())
     }
 }

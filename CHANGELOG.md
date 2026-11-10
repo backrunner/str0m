@@ -1,5 +1,186 @@
 # Unreleased
 
+# 0.25.0
+
+  * Reject SDP with conflicting RTX apt values instead of panicking #1113
+  * Avoid rescanning idle connections on repeated output polls #1011
+  * Replace BWE `set_desired_bitrate` with `set_bitrate(minimum, desired)` (breaking) #1109
+  * Drain NullPacer queues without a timeout after every send #1112
+  * Align BWE probing with libwebrtc bd3d2d3150 #1108
+  * Parse valid SDP without building combine's easy errors, about 6x faster #1118
+  * List a negotiated RED before its primary codec so libwebrtc sends redundant audio #1117
+  * Find the first TWCC send record of a feedback report by binary search #1116
+  * Fix bursty pacing with a persistent send queue #1115
+  * Bump dimpl to 0.9.0 and raise MSRV to Rust 1.89 (breaking) #1110
+  * Remove the fixed video reordering timeout setting (breaking) #1078
+  * Wait for NACK recovery and a complete successor before expiring incomplete video frames #1078
+  * Write SDP that str0m can read back when it rejects every m-line #1101
+  * Check every m-line for SDP consistency and accept rejected m-lines without payload types #1100
+  * Expose H264 NAL unit detection for single NAL, STAP-A, and FU-A payloads #1099
+  * Reject remote SDP that gives two m-lines the same mid #1097
+  * Never give two m-lines in one offer the same mid #1092
+  * Preserve VP8 picture ids across 7/15-bit width changes and keep VP8 counters in RTP order #1096
+  * Remove SDP `merge()`; applications must track queued negotiation changes (breaking) #1095
+  * Expose dimpl crypto providers for AWS-LC-RS and Apple CommonCrypto #1094
+  * Extend VP9 picture ids in `Vp9CodecExtra` to 64 bits, fixing frames dropped after wrap-around (breaking) #1091
+  * Include authenticated early RTX padding in TWCC feedback and ingress loss accounting #1086
+  * Make the SCTP receive message size configurable for data channels #1083
+  * Reduce RTX receive memory use with a 128-position sequence window #1089
+  * Rate-limit SRTP/SRTCP decryption warnings #1088
+  * Send pending keyframe and REMB requests without waiting for unrelated timers #1081
+  * Bump dimpl to 0.8.0 and sctp-proto to 0.10.7; return accepted DTLS write byte counts (breaking) #1080
+  * Preserve filler data NAL units when sending H264, H265, and H266 video #1079
+  * Support single-channel AMR-WB audio in octet-aligned and bandwidth-efficient modes #995
+  * Match SDP fmtp parameter names case-insensitively #1077
+  * Tolerate spaces and a trailing semicolon in fmtp parameters #1076
+  * Handle STUN MESSAGE-INTEGRITY as the first attribute and prevent integrity verification panics #1073
+  * Bump dimpl to 0.7.6 and sctp-proto to 0.10.6 #1075
+  * Round BWE send timestamps to milliseconds to reduce recovery-burst fragmentation #1074
+  * Support SHA-1 remote DTLS fingerprints via the crypto provider (breaking) #1072
+  * Prevent accumulated rounding error in TWCC receive timing #1071
+  * Pace per-packet NACK retries by receive-side RTT and fix DLRR RTT routing #1070
+  * Send on a nominated ICE pair only after its check succeeds #1066
+  * Stop NACK timer wakeups for paused streams after pending retries #1064
+  * Fix RTCP receiver report loss fraction wraparound #1065
+
+# 0.24.1
+
+  * Make the SCTP send buffer limit configurable and fix polling stack overflow #1062
+  * Fix stopped m-line MSID signaling and document MSID identity #1063
+  * Do not reflect the offer's `a=msid:-` "no MediaStream" sentinel in the answer #1060
+  * Guard DTLS input/output and timeout handling before initialization
+  * Limit paced media bursts to about 63 kB #1058
+
+# 0.24.0
+
+  * Keep `a=simulcast`/`a=rid` for send simulcast in SDP after the first offer.
+  * Preserve receive state across pauses; expire the oldest incomplete frame #1057
+  * Configure pause threshold; default audio/video reordering to 1 s/2 s #1057
+  * Send and receive telephone-event (DTMF) packets in frame mode with `Writer::telephone_event` #1050
+  * Stop SSRC 0 probes from repeatedly scheduling an immediate RTCP feedback timeout #1052
+  * Expose TWCC probing state and use named fields in bandwidth estimate events (breaking) #1048
+  * Support opt-in telephone-event (DTMF) SDP negotiation and raw RTP with `0-X` event ranges #1047
+  * Bound the depacketizing queue when incomplete frames keep arriving #1044
+  * Add a configurable video frame reordering timeout via `RtcConfig` #1041
+  * Support SSRC 0 bandwidth probing before media starts #1046
+  * Let `Rtc::accepts` recognize validated remote addresses in ICE-lite mode before nomination #1039
+  * Remove SChannel and use only dimpl + CNG for Windows DTLS #1038
+  * Move codec-specific packetization and RED send logic out of the payloader #1030
+  * Match the transport protocol when invalidating local and remote ICE candidates #1035
+  * Preserve the RFC 6464 audio-level voice activity bit when serializing #1032
+  * Add RFC 2198 RED (redundant audio) support for all audio codecs (breaking) #982
+
+# 0.23.1
+
+  * Guard SRTP/SRTCP and RTCP parsing against malformed input #1029
+
+# 0.23.0
+
+  * Respond to RRTR with DLRR #1022
+  * Use a local SSRC as the originator of outgoing RRTR reports #1027
+  * Add `DirectApi::send_pli_feedback` to send a PLI with a chosen sender SSRC #1025
+
+# 0.22.0
+
+  * Make audio and video RTCP report intervals configurable #1021
+  * Stop padding media packets, no crypto need it #1023
+  * Reset SCTP streams when closing data channels and safely reuse stream IDs #1010
+  * Fix small padding invisible to the pacer #1020
+  * Fix H.264 negotiation: accept a negotiable (downgradable) level and recognize the Constrained High profile #1016
+  * Expose the latest send queue information on `StreamTx` #1005
+  * Expose locally calculated interarrival jitter on `MediaIngressStats` #997
+  * Fix VP9 non-flexible SS advertising a bogus R=0 GOF for single-layer streams #999
+  * Fix AV1 depacketizer overflow on unsized OBU aggregation #1002
+  * Support G722 audio codec (16 kHz codec with 8 kHz RTP clock per RFC 3551) #992
+  * Support RFC 3389 Comfort Noise payloads #1013
+  * Apply reliability parameters to a DCEP-receiving in-band channel #1004
+  * Normalize `Rtc` shutdown and drain RTCP, SCTP, and DTLS close output consistently #1000
+  * Fix an infinite loop when DTLS timeout handling fails #1017
+
+# 0.21.0
+
+  * Upgrade to  dimpl 0.7.0 (breaking)
+  * Handle SctpAssociation as Event::Closed #986
+  * Reject SDP payload types > 127 instead of panicking when claiming PTs #983
+  * Add RTCP PSFB FMT=15 (AppSpecificFeedback) send/receive via Direct API #981
+  * Add H266/VVC RTP packetizer and depacketizer #971
+  * Negotiate SCTP max message size for data channels #852
+  * Expose the negotiated DTLS protocol version #979
+  * Make MTU size configurable #967
+  * Add optional `drv` feature for using public identity types as `drv::Input` #974 #975
+  * Send DTLS `close_notify` on `Rtc::close()` #956
+  * Fix `Simulcast::add_recv_layer` to push to recv instead of send #968
+  * Accept any non-empty SDP session name (`s=`), not just `s=-` #969
+
+# 0.20.0
+
+  * Update dimpl to 0.6.2 and sctp-proto to 0.9.1
+  * Fix repeated rx lookup cleanup bug #965
+  * Fix permissive vp8 depacketizer for invalid `l=1,t=0` cases (breaking) #963
+  * Add VP8 descriptor parsing and `vp8_patch()` to `RtpWrite` #963
+  * `write_rtp()` now takes a `RtpWrite` builder (breaking) #963
+  * Add `abs-capture-time` writer support and fixed receiver-side (breaking) #964
+  * Add stereo to opus format params #955
+  * Use `Arc<[u8]>` as input/output of media data (breaking) #959
+
+# is-0.9.1
+
+  * Expose ICE candidate pair RTT in CandidatePairStats #962
+
+# 0.19.0
+
+  * Expose H265 some already referenced profile structs #948
+  * Update to dimpl 0.6.1
+  * Update openssl to 0.10.78
+
+# is-0.9.0
+
+  * IceCandidate expose str0m/is-unique local property #951
+  * Implement ICE role conflict resolution #950
+
+# 0.18.1
+
+  * dtls: fix to resends during handshake #943
+  * Add `SdpApi::stop_media()` to stop an existing m-line #941
+  * Update chat example to use `SdpApi::stop_media()` when clients are removed #941
+  * Accept recycled m-line indexes when the previous m-line was stopped #941
+  * Always use ActPass when sending an SDP offer (RFC 8842 Section 5.2/5.5) #893
+  * Fix frame drops in Firefox due missing RTX SSRC #940
+  * Drop stale depacketizer state on stream pause and restore paused timestamp repair #929
+  * Reduce bounds checks in STUN encode/decode #931
+
+# 0.18.0
+
+  * Disable server cookie for all dimpl crypto impl #923
+  * Implement SNAP and sctp-init #811
+  * Implement wincrypto-dimpl feature #920
+  * Implement openssl-dimpl feature #919
+  * Update to dimpl 0.5.0 #916
+  * Refactor out new crate "is" (ice agent) #912
+  * Expose CSRC property in RTP Header #910
+  * Fix jitter calculation in ReceiverReports #907
+  * Preserve nomination on redundant pair replacement #908
+
+# 0.17.0
+
+  * Update to dimpl 0.4.3 #902
+  * Update ~dimpl to 0.4.2~ (see 902) and sctp-proto to 0.8.1 #892
+  * Update ~dimpl to 0.3.0~ (see 902) #874
+  * MSRV 1.85, Edition 2024 and bump deps #891
+  * Reduce allocations in AV1 packetizer/depacketizer #889
+  * Workaround DCEP panics due to reuse race condition #883
+  * sprop-max-don-diff SDP parameter #885
+  * Reduce number of RTP header extensions sent on every packet #880
+  * Add RTP-level keyframe detection for VP8, VP9, AV1, H264 and H265 #869
+  * VP9 switch packetizer to non-flexible mode (F=0) #868
+  * Fix H265 SDP negotiation level handling #872
+  * Avoid sending VLA on every packet #866
+  * Add `abs-capture-time` RTP header extension #864
+  * Adjust `IceAgent::ice_timeout` to return timeout of successful pair #875
+  * Fix infinite loop on in-band data channel stream conflict #873
+  * Add `Hash`, `PartialOrd` and `Ord` traits to `TransId` #905
+  * Fix m-line ordering when using sdp `merge()` #887
+
 # 0.16.2
 
   * Fix hot timeout loop with null pacer #863
@@ -28,7 +209,7 @@
   * BWE remove current_bitrate param (breaking) #838
   * BWE V2 (Probe clusters) #823
 
-0.15.0
+# 0.15.0
 
   * MediaData::is_keyframe() helper #805
   * Handle tcptype ICE candidates #797
@@ -40,12 +221,12 @@
   * Fix HMAC P_hash implementation for Apple Crypto #824
   * Update Apple Crypto crate to use CryptoKit #813
 
-0.14.3
+# 0.14.3
 
   * Bump dimpl 0.2.1 for SChannel compat #801
   * Reduce allocating in `str0m-aws-lc-rs` encrypt/decrypt #804
 
-0.14.2
+# 0.14.2
 
   * Fix order of DTLS pending packet poll #796
   * Defer panic on missing crypto provider until Rtc init #792

@@ -6,21 +6,21 @@ use std::str;
 use core_foundation::base::{CFType, TCFType};
 use core_foundation::data::CFData;
 use core_foundation::dictionary::CFMutableDictionary;
-use core_foundation::error::CFError;
 use core_foundation::number::CFNumber;
 use core_foundation::string::CFString;
 use der::Decode;
-use dimpl::buffer::Buf;
+use dimpl::crypto::Buf;
+use dimpl::{CryptoError, CryptoOperation};
 use security_framework::key::{Algorithm, SecKey};
 use spki::ObjectIdentifier;
 use x509_cert::Certificate as X509Certificate;
 
-use dimpl::crypto::{CipherSuite, HashAlgorithm, KeyProvider};
+use dimpl::crypto::{HashAlgorithm, KeyProvider};
 use dimpl::crypto::{SignatureAlgorithm, SignatureVerifier, SigningKey as SigningKeyTrait};
 
 // Security framework FFI bindings
 #[link(name = "Security", kind = "framework")]
-extern "C" {
+unsafe extern "C" {
     static kSecAttrKeyType: core_foundation::string::CFStringRef;
     static kSecAttrKeyTypeECSECPrimeRandom: core_foundation::string::CFStringRef;
     static kSecAttrKeyClass: core_foundation::string::CFStringRef;
@@ -57,25 +57,32 @@ impl std::fmt::Debug for EcdsaSigningKey {
 }
 
 impl SigningKeyTrait for EcdsaSigningKey {
-    fn sign(&mut self, data: &[u8], out: &mut Buf) -> Result<(), String> {
+    fn sign(
+        &mut self,
+        data: &[u8],
+        hash_alg: HashAlgorithm,
+        out: &mut Buf,
+    ) -> Result<(), CryptoError> {
+        let key_hash = self.hash_algorithm();
+        if hash_alg != key_hash {
+            return Err(CryptoError::SigningKeyHashMismatch {
+                key_hash,
+                requested: hash_alg,
+            });
+        }
+
         // Sized to the largest hash size we support.
-        let mut hash_buffer = [0; apple_cryptokit::hashing::sha384::SHA384_OUTPUT_SIZE];
+        let mut hash_buffer = [0; 48];
 
         // Hash the data first (Security framework needs pre-hashed data for digest algorithms)
         let (hash_length, algorithm) = match self.curve {
             EcCurve::P256 => {
-                apple_cryptokit::hashing::sha256_hash_to(data, hash_buffer.as_mut_slice());
-                (
-                    apple_cryptokit::hashing::sha256::SHA256_OUTPUT_SIZE,
-                    Algorithm::ECDSASignatureDigestX962SHA256,
-                )
+                hash_buffer[..32].copy_from_slice(&crate::cryptokit::sha256(data));
+                (32, Algorithm::ECDSASignatureDigestX962SHA256)
             }
             EcCurve::P384 => {
-                apple_cryptokit::hashing::sha384_hash_to(data, hash_buffer.as_mut_slice());
-                (
-                    apple_cryptokit::hashing::sha384::SHA384_OUTPUT_SIZE,
-                    Algorithm::ECDSASignatureDigestX962SHA384,
-                )
+                hash_buffer.copy_from_slice(&crate::cryptokit::sha384(data));
+                (48, Algorithm::ECDSASignatureDigestX962SHA384)
             }
         };
 
@@ -83,7 +90,7 @@ impl SigningKeyTrait for EcdsaSigningKey {
         let signature = self
             .key
             .create_signature(algorithm, &hash_buffer[..hash_length])
-            .map_err(|e| format!("Signing failed: {e}"))?;
+            .map_err(|_| CryptoError::OperationFailed(CryptoOperation::Sign))?;
 
         out.clear();
         out.extend_from_slice(&signature);
@@ -101,11 +108,13 @@ impl SigningKeyTrait for EcdsaSigningKey {
         }
     }
 
-    fn is_compatible(&self, cipher_suite: CipherSuite) -> bool {
-        matches!(
-            cipher_suite,
-            CipherSuite::ECDHE_ECDSA_AES256_GCM_SHA384 | CipherSuite::ECDHE_ECDSA_AES128_GCM_SHA256
-        )
+    fn supported_hash_algorithms(&self) -> &[HashAlgorithm] {
+        // Apple Security framework locks the hash to the curve at
+        // key-load time; only one is supported.
+        match self.curve {
+            EcCurve::P256 => &[HashAlgorithm::SHA256],
+            EcCurve::P384 => &[HashAlgorithm::SHA384],
+        }
     }
 }
 
@@ -114,7 +123,7 @@ impl SigningKeyTrait for EcdsaSigningKey {
 pub(super) struct AppleCryptoKeyProvider;
 
 impl KeyProvider for AppleCryptoKeyProvider {
-    fn load_private_key(&self, key_der: &[u8]) -> Result<Box<dyn SigningKeyTrait>, String> {
+    fn load_private_key(&self, key_der: &[u8]) -> Result<Box<dyn SigningKeyTrait>, CryptoError> {
         // Try to check if it's PEM encoded first
         if let Ok(pem_str) = str::from_utf8(key_der) {
             if pem_str.contains("-----BEGIN") {
@@ -125,8 +134,8 @@ impl KeyProvider for AppleCryptoKeyProvider {
         }
 
         // Extract raw key bytes in format Apple expects
-        let (curve, apple_key_data) = extract_apple_key_data(key_der)
-            .map_err(|e| format!("Failed to extract key data: {e}"))?;
+        let (curve, apple_key_data) =
+            extract_apple_key_data(key_der).map_err(|_| CryptoError::InvalidPrivateKey)?;
 
         let key_size = match curve {
             EcCurve::P256 => 256,
@@ -166,18 +175,7 @@ impl KeyProvider for AppleCryptoKeyProvider {
         };
 
         if key_ref.is_null() {
-            let error_msg = if !error.is_null() {
-                let cf_error = unsafe { CFError::wrap_under_create_rule(error) };
-                format!("{cf_error}")
-            } else {
-                "Unknown error".to_string()
-            };
-            return Err(format!(
-                "SecKeyCreateWithData failed for {:?} key (data len: {}): {}",
-                curve,
-                apple_key_data.len(),
-                error_msg
-            ));
+            return Err(CryptoError::InvalidPrivateKey);
         }
 
         let key = unsafe { SecKey::wrap_under_create_rule(key_ref as *mut _) };
@@ -193,8 +191,10 @@ impl KeyProvider for AppleCryptoKeyProvider {
 /// For P-384: 1 + 48 + 48 + 48 = 145 bytes
 fn extract_apple_key_data(key_der: &[u8]) -> Result<(EcCurve, Vec<u8>), String> {
     // Try PKCS#8 format first - extract the SEC1 ECPrivateKey from inside
-    let sec1_data = pkcs8::PrivateKeyInfo::from_der(key_der)
-        .map_or_else(|_| key_der.to_vec(), |info| info.private_key.to_vec());
+    let sec1_data = pkcs8::PrivateKeyInfoRef::from_der(key_der).map_or_else(
+        |_| key_der.to_vec(),
+        |info| info.private_key.as_bytes().to_vec(),
+    );
 
     // Parse SEC1 ECPrivateKey structure to extract raw bytes
     let ec_key = sec1::EcPrivateKey::try_from(sec1_data.as_slice())
@@ -273,29 +273,26 @@ impl SignatureVerifier for AppleCryptoSignatureVerifier {
         signature: &[u8],
         hash_alg: HashAlgorithm,
         sig_alg: SignatureAlgorithm,
-    ) -> Result<(), String> {
+    ) -> Result<(), CryptoError> {
         if sig_alg != SignatureAlgorithm::ECDSA {
-            return Err(format!("Unsupported signature algorithm: {sig_alg:?}"));
+            return Err(CryptoError::UnsupportedSignatureAlgorithm(sig_alg));
         }
 
-        let cert = X509Certificate::from_der(cert_der)
-            .map_err(|e| format!("Failed to parse certificate: {e}"))?;
-        let spki = &cert.tbs_certificate.subject_public_key_info;
+        let cert =
+            X509Certificate::from_der(cert_der).map_err(|_| CryptoError::CertificateParseFailed)?;
+        let spki = cert.tbs_certificate().subject_public_key_info();
 
         const OID_EC_PUBLIC_KEY: ObjectIdentifier =
             ObjectIdentifier::new_unwrap("1.2.840.10045.2.1");
 
         if spki.algorithm.oid != OID_EC_PUBLIC_KEY {
-            return Err(format!(
-                "Unsupported public key algorithm: {}",
-                spki.algorithm.oid
-            ));
+            return Err(CryptoError::UnsupportedPublicKeyAlgorithm);
         }
 
         let pubkey_bytes = spki
             .subject_public_key
             .as_bytes()
-            .ok_or_else(|| "Invalid EC subject_public_key bitstring".to_string())?;
+            .ok_or(CryptoError::InvalidSubjectPublicKey)?;
 
         // Determine key size from public key length or algorithm parameters
         let key_size = if pubkey_bytes.len() == 65 {
@@ -303,35 +300,27 @@ impl SignatureVerifier for AppleCryptoSignatureVerifier {
         } else if pubkey_bytes.len() == 97 {
             384 // P-384: 1 byte prefix + 48 bytes X + 48 bytes Y
         } else {
-            return Err(format!(
-                "Unsupported EC public key size: {} bytes",
-                pubkey_bytes.len()
-            ));
+            return Err(CryptoError::InvalidSubjectPublicKey);
         };
 
         // Sized to the largest hash size we support.
-        let mut hash_buffer = [0; apple_cryptokit::hashing::sha384::SHA384_OUTPUT_SIZE];
+        let mut hash_buffer = [0; 48];
 
         // Hash the data
         let (hash_length, algorithm) = match hash_alg {
             HashAlgorithm::SHA256 => {
-                apple_cryptokit::hashing::sha256_hash_to(data, hash_buffer.as_mut_slice());
-                (
-                    apple_cryptokit::hashing::sha256::SHA256_OUTPUT_SIZE,
-                    Algorithm::ECDSASignatureDigestX962SHA256,
-                )
+                hash_buffer[..32].copy_from_slice(&crate::cryptokit::sha256(data));
+                (32, Algorithm::ECDSASignatureDigestX962SHA256)
             }
             HashAlgorithm::SHA384 => {
-                apple_cryptokit::hashing::sha384_hash_to(data, hash_buffer.as_mut_slice());
-                (
-                    apple_cryptokit::hashing::sha384::SHA384_OUTPUT_SIZE,
-                    Algorithm::ECDSASignatureDigestX962SHA384,
-                )
+                hash_buffer.copy_from_slice(&crate::cryptokit::sha384(data));
+                (48, Algorithm::ECDSASignatureDigestX962SHA384)
             }
             _ => {
-                return Err(format!(
-                    "Unsupported hash algorithm for ECDSA: {hash_alg:?}"
-                ));
+                return Err(CryptoError::UnsupportedSignaturePair {
+                    signature: sig_alg,
+                    hash: hash_alg,
+                });
             }
         };
 
@@ -368,15 +357,7 @@ impl SignatureVerifier for AppleCryptoSignatureVerifier {
         };
 
         if key_ref.is_null() {
-            let error_msg = if !error.is_null() {
-                let cf_error = unsafe { CFError::wrap_under_create_rule(error) };
-                format!("{cf_error}")
-            } else {
-                "Unknown error".to_string()
-            };
-            return Err(format!(
-                "Failed to create public key for verification: {error_msg}"
-            ));
+            return Err(CryptoError::InvalidSubjectPublicKey);
         }
 
         let public_key = unsafe { SecKey::wrap_under_create_rule(key_ref as *mut _) };
@@ -384,7 +365,15 @@ impl SignatureVerifier for AppleCryptoSignatureVerifier {
         // Verify the signature using the high-level API
         public_key
             .verify_signature(algorithm, &hash_buffer[..hash_length], signature)
-            .map_err(|e| format!("ECDSA signature verification failed: {e}"))?;
+            .map_err(|_| CryptoError::SignatureVerificationFailed {
+                signature: sig_alg,
+                hash: hash_alg,
+                group: if key_size == 256 {
+                    dimpl::NamedGroup::Secp256r1
+                } else {
+                    dimpl::NamedGroup::Secp384r1
+                },
+            })?;
 
         Ok(())
     }

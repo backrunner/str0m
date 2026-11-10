@@ -6,8 +6,8 @@ use std::collections::VecDeque;
 pub use header::{RtcpHeader, RtcpType};
 
 mod list;
-use list::private::WordSized;
 pub use list::ReportList;
+use list::private::WordSized;
 
 mod fmt;
 pub use fmt::{FeedbackMessageType, PayloadType, TransportType};
@@ -42,12 +42,14 @@ pub use twcc::{Twcc, TwccPacketId, TwccRecvRegister, TwccSendRecord, TwccSendReg
 mod rtcpfb;
 pub use rtcpfb::RtcpFb;
 
+mod psfbapp;
 mod remb;
+pub use psfbapp::AppSpecificFeedback;
 pub use remb::Remb;
 
-use super::extend_u16;
 use super::SeqNo;
 use super::Ssrc;
+use super::extend_u16;
 
 pub trait RtcpPacket {
     /// The...
@@ -88,6 +90,9 @@ pub enum Rtcp {
     Twcc(Twcc),
     /// Receiver Estimated Maximum Bitrate. Feedback to the sender about the maximum bitrate.
     Remb(Remb),
+    /// Application-specific Payload-Specific Feedback (FMT=15, PT=206) that is not REMB.
+    /// Used for application-specific PSFB feedback (RFC 4585 Section 6.4).
+    AppSpecificFeedback(AppSpecificFeedback),
 }
 
 impl Rtcp {
@@ -236,6 +241,7 @@ impl Rtcp {
             Rtcp::Fir(v) => v.reports.is_full(),
             Rtcp::Twcc(_) => true,
             Rtcp::Remb(_) => true,
+            Rtcp::AppSpecificFeedback(_) => true,
         }
     }
 
@@ -263,6 +269,8 @@ impl Rtcp {
             Rtcp::Twcc(_) => false,
             // A REMB report is never empty.
             Rtcp::Remb(_) => false,
+            // An AppSpecificFeedback report is never empty.
+            Rtcp::AppSpecificFeedback(_) => false,
         }
     }
 
@@ -340,6 +348,7 @@ impl Rtcp {
             Fir(_) => 5,
             Twcc(_) => 6,
             Remb(_) => 7,
+            AppSpecificFeedback(_) => 8,
             ExtendedReport(_) => 10,
 
             // Goodbye last since they remove stuff.
@@ -361,6 +370,7 @@ impl RtcpPacket for Rtcp {
             Rtcp::Fir(v) => v.header(),
             Rtcp::Twcc(v) => v.header(),
             Rtcp::Remb(v) => v.header(),
+            Rtcp::AppSpecificFeedback(v) => v.header(),
         }
     }
 
@@ -376,6 +386,7 @@ impl RtcpPacket for Rtcp {
             Rtcp::Fir(v) => v.length_words(),
             Rtcp::Twcc(v) => v.length_words(),
             Rtcp::Remb(v) => v.length_words(),
+            Rtcp::AppSpecificFeedback(v) => v.length_words(),
         }
     }
 
@@ -391,6 +402,7 @@ impl RtcpPacket for Rtcp {
             Rtcp::Fir(v) => v.write_to(buf),
             Rtcp::Twcc(v) => v.write_to(buf),
             Rtcp::Remb(v) => v.write_to(buf),
+            Rtcp::AppSpecificFeedback(v) => v.write_to(buf),
         }
     }
 }
@@ -433,13 +445,17 @@ impl<'a> TryFrom<&'a [u8]> for Rtcp {
                     PayloadType::PictureLossIndication => Rtcp::Pli(buf.try_into()?),
                     PayloadType::SliceLossIndication => return Err("Ignore PayloadType type: SLI"),
                     PayloadType::ReferencePictureSelectionIndication => {
-                        return Err("Ignore PayloadType type: RPSI")
+                        return Err("Ignore PayloadType type: RPSI");
                     }
                     PayloadType::FullIntraRequest => Rtcp::Fir(buf.try_into()?),
                     PayloadType::ApplicationLayer => {
                         if header.rtcp_type() == RtcpType::PayloadSpecificFeedback {
                             if let Ok(remb) = Remb::try_from(buf) {
                                 return Ok(Rtcp::Remb(remb));
+                            }
+                            // Not REMB — parse as generic application-specific feedback
+                            if let Ok(fb) = AppSpecificFeedback::try_from(buf) {
+                                return Ok(Rtcp::AppSpecificFeedback(fb));
                             }
                         }
                         return Err("Ignore PayloadType: ApplicationLayer");
@@ -460,11 +476,7 @@ impl WordSized for Ssrc {
 /// Pad up to the next word (4 byte) boundary.
 fn pad_bytes_to_word(n: usize) -> usize {
     let pad = 4 - n % 4;
-    if pad == 4 {
-        n
-    } else {
-        n + pad
-    }
+    if pad == 4 { n } else { n + pad }
 }
 
 #[cfg(test)]

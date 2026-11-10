@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::rtp_::{Nack, ReceptionReport, SeqNo};
 
@@ -23,8 +23,10 @@ pub struct ReceiverRegister {
     /// Received at last reception report generation.
     received_prior: i64,
 
-    /// Estimated jitter. This is in the media time base, so divided by
-    /// 90_000 or 48_000 to normalize.
+    /// Interarrival jitter in **microseconds**.
+    ///
+    /// RTCP carries jitter in **RTP timestamp units** so use
+    /// [`ReceiverRegister::jitter_in_rtp_ts`] for the wire value.
     jitter: f32,
 }
 
@@ -47,8 +49,10 @@ impl TimePoint {
         // rdur is often i 90kHz (for video) or 48kHz (for audio). we need
         // a time unit of Duration, that is likely to give us an increase between
         // 1 in rdur. milliseconds is thus "too coarse"
-        let rdur =
-            ((self.rtp_time as f32 - other.rtp_time as f32) * 1_000_000.0) / self.clock_rate as f32;
+
+        // wrapping_sub to handle RTP time rollover
+        let rtp_diff = self.rtp_time.wrapping_sub(other.rtp_time) as i32;
+        let rdur = rtp_diff as f32 * 1_000_000.0 / self.clock_rate as f32;
 
         let tdur = (self.arrival - other.arrival).as_micros() as f32;
 
@@ -77,6 +81,13 @@ impl ReceiverRegister {
         self.nack.accepts(seq)
     }
 
+    /// Mark `seq` as present without counting it as received: it was rebuilt from redundancy
+    /// (RFC 2198 RED) rather than arriving on the wire. It will no longer be NACKed or accepted
+    /// as new, while `count` (and thus the reception report loss) still reflects wire loss.
+    pub fn mark_recovered(&mut self, seq: SeqNo) {
+        self.nack.update(seq);
+    }
+
     pub fn update(&mut self, seq: SeqNo, arrival: Instant, rtp_time: u32, clock_rate: u32) -> bool {
         if self.first.is_none() {
             self.first = Some(seq);
@@ -93,9 +104,26 @@ impl ReceiverRegister {
         new
     }
 
+    pub fn recovery_deadline(
+        &self,
+        range: std::ops::Range<SeqNo>,
+        received: Instant,
+        rtt: Option<Duration>,
+    ) -> Option<Instant> {
+        self.nack.recovery_deadline(range, received, rtt)
+    }
+
+    pub fn has_pending_nacks(&self) -> bool {
+        self.nack.has_pending_nacks()
+    }
+
     /// Generates a NACK report
-    pub fn nack_report(&mut self) -> Option<impl Iterator<Item = Nack>> {
-        self.nack.nack_reports()
+    pub fn nack_report(
+        &mut self,
+        now: Instant,
+        rtt: Option<Duration>,
+    ) -> Option<impl Iterator<Item = Nack>> {
+        self.nack.nack_reports(now, rtt)
     }
 
     /// Create a new reception report.
@@ -113,7 +141,7 @@ impl ReceiverRegister {
             fraction_lost: self.fraction_lost(expected, self.count as i64),
             packets_lost: packets_lost(expected, self.count as i64),
             max_seq: (*last % ((u32::MAX as u64) + 1_u64)) as u32,
-            jitter: self.jitter as u32,
+            jitter: self.jitter_in_rtp_ts(),
             last_sr_time: 0,
             last_sr_delay: 0,
         })
@@ -219,15 +247,23 @@ impl ReceiverRegister {
 
         let lost_interval = expected_interval - received_interval;
 
-        let lost = if expected_interval == 0 || lost_interval == 0 {
+        let lost = if expected_interval == 0 || lost_interval <= 0 {
             0
         } else {
-            (lost_interval << 8) / expected_interval
+            ((lost_interval << 8) / expected_interval).min(255)
         } as u8;
 
         trace!("Reception fraction lost: {}", lost);
 
         lost
+    }
+
+    /// Jitter in RTP timestamp units.
+    fn jitter_in_rtp_ts(&self) -> u32 {
+        let Some(sample_rate) = self.time_point_prior.map(|tp| tp.clock_rate) else {
+            return 0;
+        };
+        (self.jitter / 1_000_000.0 * sample_rate as f32).round() as u32
     }
 }
 
@@ -255,7 +291,22 @@ fn expected(first: SeqNo, last: SeqNo) -> i64 {
 mod test {
     use std::time::{Duration, Instant};
 
-    use crate::streams::register::{expected, packets_lost, ReceiverRegister};
+    use crate::streams::register::{ReceiverRegister, expected, packets_lost};
+
+    #[test]
+    fn clearing_register_resets_nack_timing() {
+        let mut reg = ReceiverRegister::new(None);
+        let now = Instant::now();
+        reg.update(10.into(), now, 0, 90_000);
+        reg.update(12.into(), now, 3000, 90_000);
+        assert!(reg.nack_report(now, None).is_some());
+        assert!(reg.nack_report(now, None).is_none());
+        reg.clear(Some(10.into()));
+        assert!(!reg.has_pending_nacks());
+        reg.update(12.into(), now, 3000, 90_000);
+        let nacks: Vec<_> = reg.nack_report(now, None).expect("fresh loss").collect();
+        assert_eq!(nacks[0].reports[0].pid, 11);
+    }
 
     #[test]
     fn jitter_at_0() {
@@ -303,7 +354,25 @@ mod test {
 
         // jitter is also present in reception report
         let report = r.reception_report().expect("some report");
-        assert_eq!(report.jitter, r.jitter as u32);
+        // 90kHz is 11.1us ticks, so 20us jitter is 1.8 tick which equals 2
+        // after rounding to int.
+        assert_eq!(report.jitter, 2);
+        assert_eq!(report.jitter, r.jitter_in_rtp_ts());
+    }
+
+    #[test]
+    fn fraction_lost_is_zero_when_an_interval_receives_more_than_expected() {
+        let mut reg = ReceiverRegister::new(None);
+
+        assert_eq!(reg.fraction_lost(120, 118), 4);
+        assert_eq!(reg.fraction_lost(240, 240), 0);
+    }
+
+    #[test]
+    fn fraction_lost_saturates_when_everything_is_lost() {
+        let mut reg = ReceiverRegister::new(None);
+
+        assert_eq!(reg.fraction_lost(100, 0), 255);
     }
 
     #[test]
@@ -343,5 +412,69 @@ mod test {
         assert_eq!(5, report.packets_lost);
         assert_eq!(19, report.max_seq);
         assert_eq!(0, report.jitter);
+    }
+
+    #[test]
+    fn simple_jitter_computation() {
+        // SimpleJitterComputation from receive_statistics_unittest.cc
+        const MS_PER_PACKET: u64 = 20;
+        const CODEC_SAMPLE_RATE: u32 = 48_000;
+        const SAMPLES_PER_PACKET: u32 = MS_PER_PACKET as u32 * CODEC_SAMPLE_RATE / 1_000;
+        const LATE_ARRIVAL_DELTA_MS: u64 = 100;
+        const LATE_DELTA_SAMPLES: u32 = LATE_ARRIVAL_DELTA_MS as u32 * CODEC_SAMPLE_RATE / 1_000;
+
+        let mut clock = Instant::now();
+        let mut r = ReceiverRegister::new(None);
+
+        r.update_time(clock, 0, CODEC_SAMPLE_RATE);
+        clock += Duration::from_millis(MS_PER_PACKET + LATE_ARRIVAL_DELTA_MS);
+        r.update_time(clock, SAMPLES_PER_PACKET, CODEC_SAMPLE_RATE);
+
+        assert_eq!(r.jitter_in_rtp_ts(), LATE_DELTA_SAMPLES / 16);
+    }
+
+    #[test]
+    fn all_packets_have_same_frequency() {
+        // AllPacketsHaveSamePayloadTypeFrequency from receive_statistics_unittest.cc
+        let mut clock = Instant::now();
+        let mut r = ReceiverRegister::new(None);
+
+        r.update_time(clock, 1, 8_000);
+        clock += Duration::from_millis(50);
+        r.update_time(clock, 1 + 160, 8_000);
+        clock += Duration::from_millis(50);
+        r.update_time(clock, 1 + 160 + 160, 8_000);
+
+        // packet1: no jitter calculation
+        // packet2: jitter = 0[jitter] + (abs(50[receive time ms] *
+        //          8[frequency KHz] - 160[timestamp diff]) * 16 - 0[jitter] + 8)
+        //          / 16 = 240
+        // packet3: jitter = 240[jitter] + (abs(50[receive time ms] *
+        //          8[frequency KHz] - 160[timestamp diff]) * 16 - 240[jitter] + 8)
+        //          / 16 = 465
+        // final jitter: 465 / 16 = 29
+        assert_eq!(r.jitter_in_rtp_ts(), 29);
+    }
+
+    #[test]
+    fn jitter_rtp_timestamp_rollover() {
+        // Same as jitter_same_frequency_three_packets but the timestamps are
+        // anchored so the u32 boundary falls between packets 1 and 2.
+
+        let rtp_time_1 = u32::MAX - 79;
+        let rtp_time_2 = rtp_time_1.wrapping_add(160);
+        let rtp_time_3 = rtp_time_2.wrapping_add(160);
+
+        let mut clock = Instant::now();
+        let mut r = ReceiverRegister::new(None);
+
+        r.update_time(clock, rtp_time_1, 8_000);
+        clock += Duration::from_millis(50);
+        r.update_time(clock, rtp_time_2, 8_000);
+        clock += Duration::from_millis(50);
+        r.update_time(clock, rtp_time_3, 8_000);
+
+        // Same result as jitter_same_frequency_three_packets.
+        assert_eq!(r.jitter_in_rtp_ts(), 29);
     }
 }

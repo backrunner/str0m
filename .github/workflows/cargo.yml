@@ -11,15 +11,22 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  TOOLCHAINS: com.apple.dt.toolchain.XcodeDefault
+
 jobs:
   test:
     strategy:
       matrix:
-        rust: [stable, beta, 1.81.0]
+        rust: [stable, beta, 1.89.0]
         crypto:
           - name: openssl
             os: ubuntu-latest
           - name: openssl
+            os: macos-latest
+          - name: openssl-dimpl
+            os: ubuntu-latest
+          - name: openssl-dimpl
             os: macos-latest
           - name: aws-lc-rs
             os: ubuntu-latest
@@ -35,13 +42,15 @@ jobs:
             os: windows-latest
           - name: wincrypto
             os: windows-latest
+          - name: wincrypto-dimpl
+            os: windows-latest
           - name: apple-crypto
             os: macos-latest
 
     runs-on: ${{ matrix.crypto.os }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@master
@@ -50,42 +59,50 @@ jobs:
           toolchain: ${{ matrix.rust }}
       - uses: Swatinem/rust-cache@v2
       - name: Test with ${{ matrix.crypto.name }}
-        run: cargo +${{steps.toolchain.outputs.name}} test --no-default-features --features ${{ matrix.crypto.features || matrix.crypto.name }}
+        run: cargo +${{steps.toolchain.outputs.name}} test --no-default-features --features ${{ matrix.crypto.name }}
 
   snowflake:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          # Binary assets have no text lines to format.
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /*
+            !*.pcap
+            !*.png
+            !*.graffle
       - name: Martin's snowflake formatting rules
         uses: algesten/snowflake@v1.1.0
         with:
           check_diff: true
-          line_width_rules: "CHANGELOG.md:120;c_cpp_properties.json:160;Cargo.toml:150;README.md:180;README.tpl:180;*.md:110;*.rs:110;*.toml:110;*.lock:200;*.svg:1000;*.txt:9999;DEFAULT=110"
+          # SDP fixture strings must remain on one JSON line.
+          line_width_rules: "CHANGELOG.md:120;c_cpp_properties.json:160;Cargo.toml:150;README.md:180;README.tpl:180;chrome-sdp.json:150;*.md:110;*.rs:110;*.toml:110;*.lock:200;*.svg:1000;*.txt:9999;DEFAULT=110"
 
   pii:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         id: toolchain
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@v1
+      - uses: Swatinem/rust-cache@v2
       - name: Test pii
         run: cargo +${{steps.toolchain.outputs.name}} test --test pii --features pii
 
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         id: toolchain
         with:
           toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v1
+      - uses: Swatinem/rust-cache@v2
       - name: fmt
         run: cargo +${{steps.toolchain.outputs.name}} fmt --all -- --check
       - name: clippy (default features)
@@ -103,7 +120,7 @@ jobs:
   fuzz-build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly
@@ -111,16 +128,18 @@ jobs:
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz
       - name: Build fuzz targets
-        run: cargo fuzz build
+        run: cargo fuzz build --fuzz-dir crates/fuzz
 
   related-crates:
     strategy:
       matrix:
-        rust: [stable, beta, 1.81.0]
+        rust: [stable, beta, 1.89.0]
         dir:
-          - name: proto
+          - name: crates/proto
             os: ubuntu-latest
-          - name: netem
+          - name: crates/is
+            os: ubuntu-latest
+          - name: crates/netem
             os: ubuntu-latest
           - name: crypto/apple-crypto
             os: macos-latest
@@ -134,7 +153,7 @@ jobs:
             os: windows-latest
     runs-on: ${{ matrix.dir.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@master
@@ -151,33 +170,20 @@ jobs:
         run: cargo +${{steps.toolchain.outputs.name}} clippy --manifest-path ${{ matrix.dir.name }}/Cargo.toml -- -D warnings
       - name: test
         run: cargo +${{steps.toolchain.outputs.name}} test --manifest-path ${{ matrix.dir.name }}/Cargo.toml
+      - name: Check Apple crypto cross-targets
+        if: matrix.rust == 'stable' && matrix.dir.name == 'crypto/apple-crypto'
+        env:
+          RUSTUP_TOOLCHAIN: ${{ steps.toolchain.outputs.name }}
+        run: |
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin aarch64-apple-ios aarch64-apple-ios-sim
+          bash crypto/apple-crypto/tests/build-targets.sh
+          bash crypto/apple-crypto/tests/ffi-symbol-isolation.sh
 
-  # cargo-deny:
-  #   name: cargo-deny
-
-  #   # TODO: remove this matrix when https://github.com/EmbarkStudios/cargo-deny/issues/324 is resolved
-  #   strategy:
-  #     fail-fast: false
-  #     matrix:
-  #       platform:
-  #         - aarch64-apple-ios
-  #         - aarch64-linux-android
-  #         - i686-pc-windows-gnu
-  #         - i686-pc-windows-msvc
-  #         - i686-unknown-linux-gnu
-  #         - wasm32-unknown-unknown
-  #         - x86_64-apple-darwin
-  #         - x86_64-apple-ios
-  #         - x86_64-pc-windows-gnu
-  #         - x86_64-pc-windows-msvc
-  #         - x86_64-unknown-linux-gnu
-  #         - x86_64-unknown-redox
-
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #   - uses: actions/checkout@v3
-  #   - uses: EmbarkStudios/cargo-deny-action@v1
-  #     with:
-  #       command: check
-  #       log-level: error
-  #       arguments: --all-features --target ${{ matrix.platform }}
+  cargo-deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --all-features

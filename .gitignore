@@ -6,7 +6,9 @@ tracing*
 xamples
 .vscode
 .idea
-fuzz/corpus
-fuzz/artifacts
+crates/fuzz/corpus
+crates/fuzz/artifacts
 dimpl
 webrtc
+*.pcap
+.wt

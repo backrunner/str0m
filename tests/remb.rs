@@ -7,7 +7,7 @@ use str0m::{Event, Rtc, RtcError};
 use tracing::info_span;
 
 mod common;
-use common::{init_crypto_default, init_log, negotiate, progress, TestRtc};
+use common::{TestRtc, init_crypto_default, init_log, negotiate, progress};
 
 #[test]
 pub fn remb() -> Result<(), RtcError> {
@@ -71,7 +71,9 @@ pub fn remb() -> Result<(), RtcError> {
         })
         .collect();
 
-    assert_eq!(l_remb, vec![&BweKind::Remb(mid, Bitrate::bps(123456))]);
+    let estimate = Bitrate::bps(123456);
+    let expected = BweKind::Remb { estimate, mid };
+    assert_eq!(l_remb, vec![&expected]);
 
     Ok(())
 }

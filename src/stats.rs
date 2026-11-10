@@ -4,9 +4,9 @@ use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
+use crate::Bitrate;
 use crate::rtp::SeqNo;
 use crate::rtp_::{Mid, Rid};
-use crate::Bitrate;
 use crate::{io::Protocol, rtp_::MidRid};
 
 pub(crate) struct Stats {
@@ -94,6 +94,32 @@ pub struct CandidatePairStats {
     pub local: CandidateStats,
     /// The remote candidate.
     pub remote: CandidateStats,
+    /// Round-trip time of the most recent STUN binding transaction on the
+    /// nominated pair.
+    ///
+    /// Spec equivalent of [`RTCIceCandidatePairStats.currentRoundTripTime`][1].
+    ///
+    /// This is sourced from the ICE keepalive/consent traffic and is
+    /// available even on receive-only endpoints where RTP-based RTT
+    /// estimates aren't.
+    ///
+    /// [1]: https://www.w3.org/TR/webrtc-stats/#dom-rtcicecandidatepairstats-currentroundtriptime
+    pub current_round_trip_time: Option<Duration>,
+    /// Sum of all RTTs measured from successful STUN binding transactions
+    /// on the nominated pair over its lifetime. Divide by
+    /// [`responses_received`][Self::responses_received] for the average.
+    ///
+    /// Spec equivalent of [`RTCIceCandidatePairStats.totalRoundTripTime`][1].
+    ///
+    /// [1]: https://www.w3.org/TR/webrtc-stats/#dom-rtcicecandidatepairstats-totalroundtriptime
+    pub total_round_trip_time: Duration,
+    /// Total number of STUN binding responses received on the nominated
+    /// pair over its lifetime.
+    ///
+    /// Spec equivalent of [`RTCIceCandidatePairStats.responsesReceived`][1].
+    ///
+    /// [1]: https://www.w3.org/TR/webrtc-stats/#dom-rtcicecandidatepairstats-responsesreceived
+    pub responses_received: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -171,6 +197,9 @@ pub struct MediaIngressStats {
     pub plis: u64,
     /// Number of nacks sent.
     pub nacks: u64,
+    /// Interarrival jitter, in RTP timestamp units, as reported in the last RTCP
+    /// receiver report we sent for this stream.
+    pub jitter: u32,
     /// Round-trip-time extracted from the last RTCP XR DLRR report block.
     pub rtt: Option<Duration>,
     /// Fraction of packets lost extracted from the last RTCP receiver report.
@@ -194,10 +223,10 @@ impl MediaIngressStats {
             self.rid == other.rid,
             "Cannot merge MediaIngressStats for different rids"
         );
-        let (rtt, loss) = if self.timestamp > other.timestamp {
-            (self.rtt, self.loss)
+        let (jitter, rtt, loss) = if self.timestamp > other.timestamp {
+            (self.jitter, self.rtt, self.loss)
         } else {
-            (other.rtt, other.loss)
+            (other.jitter, other.rtt, other.loss)
         };
 
         *self = Self {
@@ -208,6 +237,7 @@ impl MediaIngressStats {
             firs: self.firs + other.firs,
             plis: self.plis + other.plis,
             nacks: self.nacks + other.nacks,
+            jitter,
             rtt,
             loss,
             timestamp: self.timestamp.max(other.timestamp),

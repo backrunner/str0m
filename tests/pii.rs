@@ -15,7 +15,7 @@ mod pii_log_redaction {
 
     use str0m::format::Codec;
     use str0m::media::MediaKind;
-    use str0m::rtp::{ExtensionValues, Ssrc};
+    use str0m::rtp::{ExtensionValues, RtpWrite, Ssrc};
     use str0m::{Event, RtcError};
 
     use super::*;
@@ -23,7 +23,7 @@ mod pii_log_redaction {
     use std::sync::Once;
     use tracing::{Event as TracingEvent, Subscriber};
     use tracing_subscriber::prelude::*;
-    use tracing_subscriber::{layer::Context, Layer, Registry};
+    use tracing_subscriber::{Layer, Registry, layer::Context};
 
     static INIT: Once = Once::new();
 
@@ -130,18 +130,9 @@ mod pii_log_redaction {
                         ..Default::default()
                     };
 
-                    stream
-                        .write_rtp(
-                            pt,
-                            seq_no,
-                            time,
-                            wallclock,
-                            false,
-                            exts,
-                            false,
-                            packet.to_vec(),
-                        )
-                        .expect("clean write");
+                    stream.write_rtp(
+                        RtpWrite::new(pt, seq_no, time, wallclock, packet).ext_vals(exts),
+                    );
                 }
             }
 

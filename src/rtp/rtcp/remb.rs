@@ -7,7 +7,7 @@ const BITRATE_MAX: f32 = 2.417_842_4e24; //0x3FFFFp+63;
 const MANTISSA_MAX: u32 = 0x7FFFFF;
 const REMB_OFFSET: usize = 16;
 
-const UNIQUE_IDENTIFIER: [u8; 4] = [b'R', b'E', b'M', b'B'];
+const UNIQUE_IDENTIFIER: [u8; 4] = *b"REMB";
 
 /*
     0                   1                   2                   3
@@ -150,6 +150,12 @@ impl<'a> TryFrom<&'a [u8]> for Remb {
 
         // bitrate = mantissa * 2^exp
         let bitrate = f32::from_bits(((exp as u32) << 23) | (mantissa & MANTISSA_MAX));
+
+        // `ssrcs_len` is attacker-controlled byte  (buf[12], 0..=255)
+        // reject packets too short to hold that many trailing SSRC bytes.
+        if buf.len() < REMB_OFFSET + ssrcs_len * 4 {
+            return Err("Remb ssrcs length exceeds buffer");
+        }
 
         let mut ssrcs = vec![];
         for i in 0..ssrcs_len {

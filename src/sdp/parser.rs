@@ -1,17 +1,16 @@
-use combine::error::*;
-use combine::parser::char::*;
-use combine::parser::combinator::*;
-use combine::stream::StreamErrorFor;
-use combine::*;
-use combine::{ParseError, Parser, Stream};
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 
 use crate::crypto::Fingerprint;
 use crate::io::TcpType;
 use crate::rtp_::{Direction, Extension, Frequency, Mid, Pt, SessionId, Ssrc};
-use crate::sdp::SdpError;
 use crate::{Candidate, CandidateKind};
+use combine::error::*;
+use combine::parser::char::*;
+use combine::parser::combinator::*;
+use combine::stream::StreamErrorFor;
+use combine::*;
+use combine::{ParseError, Parser, Stream};
 
 use super::data::*;
 
@@ -32,7 +31,8 @@ where
 /// 1. First line must be v=0
 /// 2. The second SDP line MUST be an "o=" line The sess-id MUST be representable by a 64-bit signed
 ///    integer, and the initial value MUST be less than (2**62)-1
-/// 3. Third line a single dash SHOULD be used as the session name, e.g. "s=-"
+/// 3. Third line is the session name. The "s=" field MUST NOT be empty and SHOULD contain
+///    ISO 10646 characters (RFC 8866 section 5.3).
 ///
 /// Session is over when we find a "t=" line MUST be added, both <start-time> and <stop-time>
 ///    SHOULD be set to zero, e.g. "t=0 0".
@@ -44,7 +44,8 @@ where
     (
         typed_line('v', token('0')), // v=0
         originator_line(),           // o=- 6564425948916445306 2 IN IP4 127.0.0.1
-        typed_line('s', token('-')), // s=-
+        // The "s=" field MUST NOT be empty (RFC 8866 section 5.3)
+        typed_line('s', any_value()),
         many::<Vec<_>, _, _>(ignored_session_line()),
         optional(bandwidth_line()),                         // b=CT:1234
         typed_line('t', string("0 0")),                     // t=0 0
@@ -120,11 +121,13 @@ where
         "group",
         (
             not_sp(),
-            token(' '),
-            sep_by1(not_sp().map(|m| Mid::from(m.as_str())), token(' ')),
+            many::<Vec<_>, _, _>(attempt(
+                (token(' '), not_sp()).map(|(_, m)| Mid::from(m.as_str())),
+            )),
+            optional(token(' ')),
         ),
     )
-    .map(|(typ, _, mids)| SessionAttribute::Group { typ, mids });
+    .map(|(typ, mids, _)| SessionAttribute::Group { typ, mids });
 
     // a=msid-semantic: WMS 9ce81ef6-c7cb-4da5-8f5f-3e7cc9b5f9b0
     let msid_semantic = attribute_line(
@@ -155,7 +158,8 @@ where
     // a=ice-options:trickle
     let ice_opt = attribute_line("ice-options", any_value()).map(SessionAttribute::IceOptions);
 
-    // a=fingerprint:sha-256 45:AD:5C:82:F8:BE:B5:2A:D1:74:A6:16:D0:50:CD:86:9C:97:9D:BD:06:8C:C9:85:C9:CD:AB:2B:A8:56:03:CD
+    // a=fingerprint:sha-256 45:AD:5C:82:F8:BE:B5:2A:D1:74:A6:16:D0:50:CD:86:9C:97:9D:BD:06:\
+    // 8C:C9:85:C9:CD:AB:2B:A8:56:03:CD
     // "sha-1" / "sha-224" / "sha-256" /
     // "sha-384" / "sha-512" /
     // "md5" / "md2"
@@ -201,16 +205,6 @@ where
         attempt(endof),
         unused,
     ))
-}
-
-/// Parse a candidate string into a [Candidate].
-///
-/// Does not parse an `a=` prefix or trailing newline.
-pub fn parse_candidate(s: &str) -> Result<Candidate, SdpError> {
-    candidate()
-        .parse(s)
-        .map(|(c, _)| c)
-        .map_err(|e| SdpError::ParseError(e.to_string()))
 }
 
 /// Parser for candidate, without attribute prefix (a=).
@@ -309,7 +303,7 @@ where
                 ufrag,   // (" ufrag ", ufrag)
                 _,       // ("network-cost", network_cost)
             )| {
-                Candidate::parsed(
+                Candidate::from_parts(
                     found,
                     comp_id,
                     proto,
@@ -330,15 +324,6 @@ where
     Input: Stream<Token = char>,
     Input::Error: ParseError<Input::Token, Input::Range, Input::Position>,
 {
-    // a=candidate:1 1 udp 2113929471 203.0.113.100 10100 typ host
-    // a=candidate:1 2 udp 2113929470 203.0.113.100 10101 typ host
-    // a=candidate:1 1 udp 1845494015 198.51.100.100 11100 typ srflx raddr 203.0.113.100 rport 10100
-    // a=candidate:1 1 udp 255 192.0.2.100 12100 typ relay raddr 198.51.100.100 rport 11100
-    // a=candidate:3684617590 1 udp 2122260223 10.217.229.219 50028 typ host generation 0 network-id 1 network-cost 900
-    // a=candidate:387183333 1 udp 1686052607 113.185.55.72 31267 typ srflx raddr 10.217.229.219 rport 50028 generation 0 network-id 1 network-cost 900
-    // a=candidate:2501718406 1 tcp 1518280447 10.217.229.219 9 typ host tcptype active generation 0 network-id 1 network-cost 900
-    // a=candidate:387183333 1 udp 1686052607 113.185.55.72 41775 typ srflx raddr 10.217.229.219 rport 50028 generation 0 network-id 1 network-cost 900
-
     (string("a="), candidate(), line_end()).map(|(_, c, _)| c)
 }
 
@@ -467,7 +452,8 @@ where
     // a=ice-options:trickle
     let ice_opt = attribute_line("ice-options", any_value()).map(MediaAttribute::IceOptions);
 
-    // a=fingerprint:sha-256 45:AD:5C:82:F8:BE:B5:2A:D1:74:A6:16:D0:50:CD:86:9C:97:9D:BD:06:8C:C9:85:C9:CD:AB:2B:A8:56:03:CD
+    // a=fingerprint:sha-256 45:AD:5C:82:F8:BE:B5:2A:D1:74:A6:16:D0:50:CD:86:9C:97:9D:BD:06:\
+    // 8C:C9:85:C9:CD:AB:2B:A8:56:03:CD
     // "sha-1" / "sha-224" / "sha-256" /
     // "sha-384" / "sha-512" /
     // "md5" / "md2"
@@ -511,6 +497,12 @@ where
         }),
     )
     .map(MediaAttribute::MaxMessageSize);
+
+    // a=sctp-init:<base64-encoded SCTP INIT chunk>
+    // See draft-hancke-tsvwg-snap (§4.2: base64 defined in RFC 4566, i.e. standard with padding)
+    //
+    // The base64 value is stored as-is; decoding happens when consumed.
+    let sctp_init = attribute_line("sctp-init", any_value()).map(MediaAttribute::SctpInit);
 
     // a=extmap:1 urn:ietf:params:rtp-hdrext:ssrc-audio-level
     // a=extmap:<value>["/"<direction>] <URI> <extensionattributes>
@@ -559,9 +551,17 @@ where
 
     let pt = || {
         not_sp().and_then(|s| {
-            s.parse::<u8>()
-                .map(Pt::from)
-                .map_err(StreamErrorFor::<Input>::message_format)
+            let pt = s
+                .parse::<u8>()
+                .map_err(StreamErrorFor::<Input>::message_format)?;
+            // RTP payload type is 7-bit; reject out-of-range values rather than panicking later
+            // when PTs are claimed against a 128-entry table.
+            if pt > 127 {
+                return Err(StreamErrorFor::<Input>::message_format(format!(
+                    "payload type out of range (0-127): {pt}"
+                )));
+            }
+            Ok(Pt::from(pt))
         })
     };
 
@@ -605,22 +605,68 @@ where
     let rtcp_fb = attribute_line("rtcp-fb", (pt(), token(' '), any_value()))
         .map(|(pt, _, value)| MediaAttribute::RtcpFb { pt, value });
 
-    let fmtp_param = sep_by1(key_val(), token(';')).map(FormatParam::parse_pairs);
+    // Tolerate horizontal whitespace around `;` and a trailing `;`.
+    let fmtp_param = (
+        sep_end_by1(attempt(key_val()), attempt((spaces(false), token(';')))),
+        spaces(false),
+    )
+        .map(|(pairs, _)| FormatParam::parse_pairs(pairs));
 
     // a=fmtp:111 minptime=10; useinbandfec=1
     // a=fmtp:111 minptime=10;useinbandfec=1
     let fmtp1 = attribute_line("fmtp", (pt(), token(' '), fmtp_param))
         .map(|(pt, _, values)| MediaAttribute::Fmtp { pt, values });
 
-    // a=fmtp:101 0-15
-    let fmtp2 = attribute_line("fmtp", (pt(), token(' '), not_sp())).map(|(pt, _, _value)| {
-        MediaAttribute::Fmtp {
-            pt,
-            values: vec![FormatParam::Unknown],
-        }
+    // Parse bare fmtp syntax without assigning codec meaning; rtpmap decides that later.
+    let fmtp_pt_num = || {
+        many1::<String, _, _>(satisfy(|c| c != '/' && c != '\r' && c != '\n')).and_then(|s| {
+            s.parse::<u8>()
+                .map_err(StreamErrorFor::<Input>::message_format)
+        })
+    };
+    let fmtp_pt_list = attribute_line(
+        "fmtp",
+        (
+            pt(),
+            token(' '),
+            fmtp_pt_num(),
+            skip_many1((token('/'), fmtp_pt_num())),
+        ),
+    )
+    .map(|(pt, _, primary, _)| MediaAttribute::Fmtp {
+        pt,
+        values: vec![FormatParam::BarePtList(Pt::from(primary))],
     });
 
-    let fmtp = choice((attempt(fmtp1), attempt(fmtp2)));
+    let fmtp_range = attribute_line(
+        "fmtp",
+        (
+            pt(),
+            token(' '),
+            string("0-"),
+            many1::<String, _, _>(satisfy(|c: char| c.is_ascii_digit())).and_then(|s| {
+                s.parse::<u8>()
+                    .map_err(StreamErrorFor::<Input>::message_format)
+            }),
+        ),
+    )
+    .map(|(pt, _, _, max)| MediaAttribute::Fmtp {
+        pt,
+        values: vec![FormatParam::BareRange(max)],
+    });
+
+    let fmtp_unknown = attribute_line("fmtp", (pt(), optional(token(' ')), optional(any_value())))
+        .map(|(pt, _, _)| MediaAttribute::Fmtp {
+            pt,
+            values: vec![FormatParam::Unknown],
+        });
+
+    let fmtp = choice((
+        attempt(fmtp1),
+        attempt(fmtp_pt_list),
+        attempt(fmtp_range),
+        attempt(fmtp_unknown),
+    ));
 
     // a=rid:<rid-id> <direction> [pt=<fmt-list>;]<restriction>=<value>
     let rid = attribute_line(
@@ -761,31 +807,37 @@ where
 
     let unused = typed_line('a', any_value()).map(MediaAttribute::Unused);
 
+    // Split into two choice() calls because combine's choice macro supports at most 25 parsers.
     choice((
-        attempt(ice_ufrag),
-        attempt(ice_pwd),
-        attempt(ice_opt),
-        attempt(finger),
-        attempt(setup),
-        attempt(mid),
-        attempt(sctp_port),
-        attempt(max_message_size),
-        attempt(extmap),
-        attempt(direction),
-        attempt(msid),
-        attempt(rtcp),
-        attempt(rtcpmux),
-        attempt(rtcpmuxonly),
-        attempt(rtcprsize),
-        attempt(cand),
-        attempt(endof),
-        attempt(rtpmap),
-        attempt(rtcp_fb),
-        attempt(fmtp),
-        attempt(rid),
-        attempt(simulcast),
-        attempt(ssrc_group),
-        attempt(ssrc),
+        attempt(choice((
+            attempt(ice_ufrag),
+            attempt(ice_pwd),
+            attempt(ice_opt),
+            attempt(finger),
+            attempt(setup),
+            attempt(mid),
+            attempt(sctp_port),
+            attempt(max_message_size),
+            attempt(sctp_init),
+            attempt(extmap),
+            attempt(direction),
+            attempt(msid),
+            attempt(rtcp),
+        ))),
+        attempt(choice((
+            attempt(rtcpmux),
+            attempt(rtcpmuxonly),
+            attempt(rtcprsize),
+            attempt(cand),
+            attempt(endof),
+            attempt(rtpmap),
+            attempt(rtcp_fb),
+            attempt(fmtp),
+            attempt(rid),
+            attempt(simulcast),
+            attempt(ssrc_group),
+            attempt(ssrc),
+        ))),
         unused,
     ))
 }
@@ -858,18 +910,48 @@ where
     Input::Error: ParseError<Input::Token, Input::Range, Input::Position>,
 {
     (
-        optional(spaces()),
-        many1(satisfy(|c| c != '=' && c != ' ' && c != '\r' && c != '\n')),
+        spaces(false),
+        many1(satisfy(|c| is_param_char(c, '='))),
         token('='),
-        many1(satisfy(|c| c != ';' && c != ' ' && c != '\r' && c != '\n')),
+        many1(satisfy(|c| is_param_char(c, ';'))),
     )
         .map(|(_, key, _, val)| (key, val))
+}
+
+/// Skip spaces and tabs, optionally including CR and LF.
+fn spaces<Input>(newline: bool) -> impl Parser<Input, Output = ()>
+where
+    Input: Stream<Token = char>,
+    Input::Error: ParseError<Input::Token, Input::Range, Input::Position>,
+{
+    skip_many(satisfy(move |c| {
+        matches!(c, ' ' | '\t') || (newline && matches!(c, '\r' | '\n'))
+    }))
+}
+
+// Parameter tokens exclude horizontal whitespace, line endings, and their delimiter.
+fn is_param_char(c: char, delimiter: char) -> bool {
+    c != delimiter && !matches!(c, ' ' | '\t' | '\r' | '\n')
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::format::Codec;
     use crate::io::Protocol;
+
+    #[test]
+    fn spaces_preserve_or_consume_line_endings() {
+        for end in ["\r\n", "\n", "\r"] {
+            let input = format!(" \t{end}next");
+            let remaining = format!("{end}next");
+            assert_eq!(
+                spaces(false).parse(input.as_str()),
+                Ok(((), remaining.as_str()))
+            );
+            assert_eq!(spaces(true).parse(input.as_str()), Ok(((), "next")));
+        }
+    }
 
     #[test]
     fn line_a() {
@@ -931,6 +1013,68 @@ mod test {
                 ""
             ))
         );
+    }
+
+    #[test]
+    fn media_attribute_line_fmtp_horizontal_whitespace() {
+        let expected = MediaAttribute::Fmtp {
+            pt: 111.into(),
+            values: vec![FormatParam::MinPTime(10), FormatParam::UseInbandFec(true)],
+        };
+        for params in [
+            "minptime=10;\tuseinbandfec=1",
+            "\tminptime=10;useinbandfec=1",
+            "minptime=10\t;useinbandfec=1",
+            "minptime=10;useinbandfec=1\t",
+            " \tminptime=10 \t; \tuseinbandfec=1 \t; \t",
+        ] {
+            for end in ["\r\n", "\n", ""] {
+                let next = if end.is_empty() { "" } else { "a=mid:0" };
+                let line = format!("a=fmtp:111 {params}{end}{next}");
+                assert_eq!(
+                    media_attribute_line().parse(line.as_str()),
+                    Ok((expected.clone(), next)),
+                    "{line:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn media_attribute_line_fmtp_preserves_next_line() {
+        for end in ["\r\n", "\n"] {
+            for next in ["a=mid:0", "a=sendrecv"] {
+                let line = format!("a=fmtp:111 minptime=10;useinbandfec=1;{end}{next}");
+                let expected = MediaAttribute::Fmtp {
+                    pt: 111.into(),
+                    values: vec![FormatParam::MinPTime(10), FormatParam::UseInbandFec(true)],
+                };
+                assert_eq!(
+                    media_attribute_line().parse(line.as_str()),
+                    Ok((expected, next))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn media_attribute_line_fmtp_separator_whitespace() {
+        let expected = MediaAttribute::Fmtp {
+            pt: 111.into(),
+            values: vec![FormatParam::MinPTime(10), FormatParam::UseInbandFec(true)],
+        };
+        for line in [
+            "a=fmtp:111 minptime=10;useinbandfec=1;\r\na=rtcp-fb:111 nack",
+            "a=fmtp:111 minptime=10;useinbandfec=1 \r\na=rtcp-fb:111 nack",
+            "a=fmtp:111 minptime=10 ;useinbandfec=1\r\na=rtcp-fb:111 nack",
+            "a=fmtp:111 minptime=10; useinbandfec=1; \r\na=rtcp-fb:111 nack",
+        ] {
+            assert_eq!(
+                media_attribute_line().parse(line),
+                Ok((expected.clone(), "a=rtcp-fb:111 nack")),
+                "{line:?}"
+            );
+        }
     }
 
     #[test]
@@ -1014,6 +1158,23 @@ mod test {
     }
 
     #[test]
+    fn rtpmap_payload_type_over_127_is_rejected() {
+        // RTP payload type is 7-bit. An out-of-range PT in a=rtpmap must not be accepted as an
+        // RtpMap; otherwise it becomes a PayloadParams that panics when claimed against a
+        // 128-entry table. It instead falls through to Unused and is ignored (the m-line then
+        // fails its own "missing a=rtpmap" check). 127 is the largest valid PT.
+        let bad = media_attribute_line().parse("a=rtpmap:200 opus/48000/2");
+        assert!(
+            !matches!(bad, Ok((MediaAttribute::RtpMap { .. }, _))),
+            "out-of-range rtpmap PT must not parse as RtpMap: {bad:?}"
+        );
+        assert!(matches!(
+            media_attribute_line().parse("a=rtpmap:127 opus/48000/2"),
+            Ok((MediaAttribute::RtpMap { .. }, _))
+        ));
+    }
+
+    #[test]
     fn session_parser_simple() {
         let sdp = "v=0\n\
             o=- 6564425948916445306 2 IN IP4 127.0.0.1\n\
@@ -1043,12 +1204,88 @@ mod test {
     }
 
     #[test]
+    fn session_parser_group_without_mids() {
+        for group in ["a=group:BUNDLE\r\n", "a=group:BUNDLE \r\n"] {
+            let sdp = format!(
+                "v=0\r\n\
+                o=- 6564425948916445306 2 IN IP4 127.0.0.1\r\n\
+                s=-\r\n\
+                t=0 0\r\n\
+                {group}"
+            );
+            let (session, rest) = session_parser().parse(sdp.as_str()).unwrap();
+            assert_eq!(
+                session.attrs,
+                vec![SessionAttribute::Group {
+                    typ: "BUNDLE".into(),
+                    mids: vec![],
+                }]
+            );
+            assert_eq!(rest, "");
+        }
+    }
+
+    #[test]
+    fn session_parser_named_session() {
+        // A session name other than "-".
+        let sdp = "v=0\r\n\
+            o=publisher 4489045141692799359 2 IN IP4 127.0.0.1\r\n\
+            s=NamedPublishSession\r\n\
+            t=0 0\r\n\
+            a=group:BUNDLE 0 1\r\n\
+            a=extmap-allow-mixed\r\n\
+            a=msid-semantic: WMS\r\n";
+        assert_eq!(
+            session_parser().parse(sdp),
+            Ok((
+                Session {
+                    id: 4_489_045_141_692_799_359.into(),
+                    bw: None,
+                    attrs: vec![
+                        SessionAttribute::Group {
+                            typ: "BUNDLE".into(),
+                            mids: vec!["0".into(), "1".into()],
+                        },
+                        SessionAttribute::Unused("extmap-allow-mixed".into()),
+                        SessionAttribute::Unused("msid-semantic: WMS".into()),
+                    ],
+                },
+                ""
+            ))
+        );
+    }
+
+    #[test]
+    fn session_parser_space_session_name() {
+        // "If a session has no meaningful name, the value "s= " SHOULD be used
+        // (i.e., a single space as the session name)." (RFC 8866 section 5.3)
+        let sdp = "v=0\n\
+            o=- 6564425948916445306 2 IN IP4 127.0.0.1\n\
+            s= \n\
+            t=0 0\n\
+            ";
+        assert_eq!(
+            session_parser().parse(sdp),
+            Ok((
+                Session {
+                    id: 6_564_425_948_916_445_306.into(),
+                    bw: None,
+                    attrs: vec![],
+                },
+                ""
+            ))
+        );
+    }
+
+    #[test]
     fn parse_sdp_firefox() {
         let sdp = "v=0\r\n\
             o=mozilla...THIS_IS_SDPARTA-83.0 7052848360639826063 0 IN IP4 0.0.0.0\r\n\
             s=-\r\n\
             t=0 0\r\n\
-            a=fingerprint:sha-256 37:FC:96:B5:73:98:E6:F9:C5:0B:D9:EE:B1:F8:D0:01:07:2E:75:E8:6C:A4:32:A7:DC:63:99:5E:68:5C:BF:FB\r\n\
+            a=fingerprint:sha-256 \
+                37:FC:96:B5:73:98:E6:F9:C5:0B:D9:EE:B1:F8:D0:01:07:2E:75:E8:6C:A4:32:A7:DC:63:\
+                99:5E:68:5C:BF:FB\r\n\
             a=ice-options:trickle\r\n\
             a=msid-semantic:WMS *\r\n";
 
@@ -1089,7 +1326,9 @@ mod test {
             o=mozilla...THIS_IS_SDPARTA-84.0 9033133899747520364 1 IN IP4 0.0.0.0\r\n\
             s=-\r\n\
             t=0 0\r\n\
-            a=fingerprint:sha-256 AE:DC:49:AE:CA:55:35:CB:4E:FA:FE:70:99:30:C0:14:C3:B8:06:80:1F:A9:DA:9A:7C:FB:B7:20:AB:83:60:45\r\n\
+            a=fingerprint:sha-256 \
+                AE:DC:49:AE:CA:55:35:CB:4E:FA:FE:70:99:30:C0:14:C3:B8:06:80:1F:A9:DA:9A:7C:FB:\
+                B7:20:AB:83:60:45\r\n\
             a=group:BUNDLE 0\r\n\
             a=ice-options:trickle\r\n\
             a=msid-semantic:WMS *\r\n\
@@ -1133,7 +1372,9 @@ mod test {
             a=ice-ufrag:S5hk\r\n\
             a=ice-pwd:0zV/Yu3y8aDzbHgqWhnVQhqP\r\n\
             a=ice-options:trickle\r\n\
-            a=fingerprint:sha-256 8C:64:ED:03:76:D0:3D:B4:88:08:91:64:08:80:A8:C6:5A:BF:8B:4E:38:27:96:CA:08:49:25:73:46:60:20:DC\r\n\
+            a=fingerprint:sha-256 \
+                8C:64:ED:03:76:D0:3D:B4:88:08:91:64:08:80:A8:C6:5A:BF:8B:4E:38:27:96:CA:08:49:\
+                25:73:46:60:20:DC\r\n\
             a=setup:actpass\r\n\
             a=mid:0\r\n\
             a=extmap:1 urn:ietf:params:rtp-hdrext:ssrc-audio-level\r\n\
@@ -1161,7 +1402,8 @@ mod test {
             a=rtpmap:113 telephone-event/16000\r\n\
             a=rtpmap:126 telephone-event/8000\r\n\
             a=ssrc:3948621874 cname:xeXs3aE9AOBn00yJ\r\n\
-            a=ssrc:3948621874 msid:5UUdwiuY7OML2EkQtF38pJtNP5v7In1LhjEK f78dde68-7055-4e20-bb37-433803dd1ed1\r\n\
+            a=ssrc:3948621874 msid:5UUdwiuY7OML2EkQtF38pJtNP5v7In1LhjEK \
+                f78dde68-7055-4e20-bb37-433803dd1ed1\r\n\
             a=ssrc:3948621874 mslabel:5UUdwiuY7OML2EkQtF38pJtNP5v7In1LhjEK\r\n\
             a=ssrc:3948621874 label:f78dde68-7055-4e20-bb37-433803dd1ed1\r\n\
             ";
@@ -1169,6 +1411,64 @@ mod test {
         let parsed = sdp_parser().parse(sdp);
 
         assert!(parsed.is_ok());
+    }
+
+    #[test]
+    fn parse_offer_sdp_ffmpeg_whip() {
+        // ffmpeg -re \
+        //   -f lavfi -i "testsrc=size=640x480:rate=30" \
+        //   -f lavfi -i "sine=frequency=440:sample_rate=48000" \
+        //   -c:v libx264 -profile:v baseline -pix_fmt yuv420p -g 60 -tune zerolatency \
+        //   -c:a libopus -ar 48000 -ac 2 \
+        //   -f whip "http://127.0.0.1:8080/whip"
+        let sdp = "v=0\r\n\
+            o=FFmpeg 4489045141692799359 2 IN IP4 127.0.0.1\r\n\
+            s=FFmpegPublishSession\r\n\
+            t=0 0\r\n\
+            a=group:BUNDLE 0 1\r\n\
+            a=extmap-allow-mixed\r\n\
+            a=msid-semantic: WMS\r\n\
+            m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+            c=IN IP4 0.0.0.0\r\n\
+            a=ice-ufrag:08a9c3f4\r\n\
+            a=ice-pwd:a202d23be47d1decaa6f67d04d4e6c16\r\n\
+            a=fingerprint:sha-256 21:69:7C:46:D3:DC:4D:D3:66:61:5C:C5:6A:0B:F7:36\
+            :BD:91:A9:2A:FF:BC:1A:59:D9:38:38:C8:E2:A4:8D:AF\r\n\
+            a=setup:passive\r\n\
+            a=mid:0\r\n\
+            a=sendonly\r\n\
+            a=msid:FFmpeg audio\r\n\
+            a=rtcp-mux\r\n\
+            a=rtpmap:111 opus/48000/2\r\n\
+            a=ssrc:3166090378 cname:FFmpeg\r\n\
+            a=ssrc:3166090378 msid:FFmpeg audio\r\n\
+            m=video 9 UDP/TLS/RTP/SAVPF 106 105\r\n\
+            c=IN IP4 0.0.0.0\r\n\
+            a=ice-ufrag:08a9c3f4\r\n\
+            a=ice-pwd:a202d23be47d1decaa6f67d04d4e6c16\r\n\
+            a=fingerprint:sha-256 21:69:7C:46:D3:DC:4D:D3:66:61:5C:C5:6A:0B:F7:36\
+            :BD:91:A9:2A:FF:BC:1A:59:D9:38:38:C8:E2:A4:8D:AF\r\n\
+            a=setup:passive\r\n\
+            a=mid:1\r\n\
+            a=sendonly\r\n\
+            a=msid:FFmpeg video\r\n\
+            a=rtcp-mux\r\n\
+            a=rtcp-rsize\r\n\
+            a=rtpmap:106 H264/90000\r\n\
+            a=fmtp:106 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001e\r\n\
+            a=rtcp-fb:106 nack\r\n\
+            a=rtpmap:105 rtx/90000\r\n\
+            a=fmtp:105 apt=106\r\n\
+            a=ssrc-group:FID 3166090379 3166090380\r\n\
+            a=ssrc:3166090379 cname:FFmpeg\r\n\
+            a=ssrc:3166090379 msid:FFmpeg video\r\n\
+            ";
+
+        let (sdp, _) = sdp_parser().parse(sdp).unwrap();
+
+        assert_eq!(sdp.media_lines.len(), 2);
+        assert_eq!(sdp.media_lines[0].mid().to_string(), "0");
+        assert_eq!(sdp.media_lines[1].mid().to_string(), "1");
     }
 
     #[test]
@@ -1185,7 +1485,9 @@ mod test {
         a=ice-ufrag:HhS+\r\n\
         a=ice-pwd:FhYTGhlAtKCe6KFIX8b+AThW\r\n\
         a=ice-options:trickle\r\n\
-        a=fingerprint:sha-256 B4:12:1C:7C:7D:ED:F1:FA:61:07:57:9C:29:BE:58:E3:BC:41:E7:13:8E:7D:D3:9D:1F:94:6E:A5:23:46:94:23\r\n\
+        a=fingerprint:sha-256 \
+            B4:12:1C:7C:7D:ED:F1:FA:61:07:57:9C:29:BE:58:E3:BC:41:E7:13:8E:7D:D3:9D:1F:94:6E:\
+            A5:23:46:94:23\r\n\
         a=setup:actpass\r\n\
         a=mid:0\r\n\
         a=sctp-port:5000\r\n\
@@ -1217,8 +1519,45 @@ mod test {
     }
 
     #[test]
+    fn bare_static_audio_pts_are_resolved() {
+        let sdp = "v=0\r\n\
+        o=- 1 1 IN IP4 127.0.0.1\r\n\
+        s=-\r\n\
+        t=0 0\r\n\
+        a=group:BUNDLE 0\r\n\
+        m=audio 9 UDP/TLS/RTP/SAVPF 0 8 9 13\r\n\
+        c=IN IP4 0.0.0.0\r\n\
+        a=setup:actpass\r\n\
+        a=sendrecv\r\n\
+        a=mid:0\r\n\
+        ";
+
+        let (sdp, _) = sdp_parser()
+            .parse(sdp)
+            .expect("static PTs must not require an a=rtpmap line");
+        sdp.assert_consistency()
+            .expect("bare static PTs are consistent");
+        let params = sdp.media_lines[0].rtp_params();
+
+        let definitions: Vec<_> = params
+            .iter()
+            .map(|p| (*p.pt(), p.spec().codec, p.spec().clock_rate))
+            .collect();
+        assert_eq!(
+            definitions,
+            vec![
+                (0, Codec::PCMU, Frequency::EIGHT_KHZ),
+                (8, Codec::PCMA, Frequency::EIGHT_KHZ),
+                (9, Codec::G722, Frequency::SIXTEEN_KHZ),
+                (13, Codec::CN, Frequency::EIGHT_KHZ),
+            ]
+        );
+    }
+
+    #[test]
     fn parse_candidates() {
-        let a = "a=candidate:1 1 udp 1845494015 198.51.100.100 11100 typ srflx raddr 203.0.113.100 rport 10100 ufrag abc\r\n";
+        let a = "a=candidate:1 1 udp 1845494015 198.51.100.100 11100 typ srflx raddr \
+            203.0.113.100 rport 10100 ufrag abc\r\n";
 
         let (c, _) = candidate_attribute().parse(a).unwrap();
         assert_eq!(c.ufrag(), Some("abc"));
@@ -1227,24 +1566,27 @@ mod test {
         let (c, _) = candidate_attribute().parse(a).unwrap();
         assert_eq!(c.ufrag(), Some("abc"));
 
-        let a = "a=candidate:3684617590 1 udp 2122260223 10.217.229.219 50028 typ host generation 0 network-id 1 network-cost 900";
+        let a = "a=candidate:3684617590 1 udp 2122260223 10.217.229.219 50028 typ host \
+            generation 0 network-id 1 network-cost 900";
         let (c, _) = candidate_attribute().parse(a).unwrap();
         assert_eq!(c.addr(), "10.217.229.219:50028".parse().unwrap());
 
-        let a = "a=candidate:387183333 1 udp 1686052607 113.185.55.72 31267 typ srflx raddr 10.217.229.219 rport 50028 generation 0 network-id 1 network-cost 900";
+        let a = "a=candidate:387183333 1 udp 1686052607 113.185.55.72 31267 typ srflx raddr \
+            10.217.229.219 rport 50028 generation 0 network-id 1 network-cost 900";
         let (c, _) = candidate_attribute().parse(a).unwrap();
         assert_eq!(c.addr(), "113.185.55.72:31267".parse().unwrap());
 
-        let a = "a=candidate:2501718406 1 tcp 1518280447 10.217.229.219 9 typ host tcptype active generation 0 network-id 1 network-cost 900";
+        let a = "a=candidate:2501718406 1 tcp 1518280447 10.217.229.219 9 typ host tcptype \
+            active generation 0 network-id 1 network-cost 900";
         let (c, _) = candidate_attribute().parse(a).unwrap();
         assert_eq!(c.addr(), "10.217.229.219:9".parse().unwrap());
 
-        let a = "a=candidate:387183333 1 udp 1686052607 113.185.55.72 41775 typ srflx raddr 10.217.229.219 rport 50028 generation 0 network-id 1 network-cost 900";
+        let a = "a=candidate:387183333 1 udp 1686052607 113.185.55.72 41775 typ srflx raddr \
+            10.217.229.219 rport 50028 generation 0 network-id 1 network-cost 900";
         let (c, _) = candidate_attribute().parse(a).unwrap();
         assert_eq!(c.addr(), "113.185.55.72:41775".parse().unwrap());
 
-        let a =
-            "a=candidate:3936339338 1 udp 2122265343 fd00:f8aa:3ff5:5914:90bf:3c5:3378:9d4b 59125 \
+        let a = "a=candidate:3936339338 1 udp 2122265343 fd00:f8aa:3ff5:5914:90bf:3c5:3378:9d4b 59125 \
             typ host generation 0 network-id 4 network-cost 50";
         let (c, _) = candidate_attribute().parse(a).unwrap();
         assert_eq!(
@@ -1276,7 +1618,9 @@ mod test {
         o=mozilla...THIS_IS_SDPARTA-99.0 7710052215259647220 2 IN IP4 0.0.0.0\r\n\
         s=-\r\n\
         t=0 0\r\n\
-        a=fingerprint:sha-256 A6:64:23:37:94:7E:4B:40:F6:62:86:8C:DD:09:D5:08:7E:D4:0E:68:58:93:45:EC:99:F2:91:F7:19:72:E7:BB\r\n\
+        a=fingerprint:sha-256 \
+            A6:64:23:37:94:7E:4B:40:F6:62:86:8C:DD:09:D5:08:7E:D4:0E:68:58:93:45:EC:99:F2:91:\
+            F7:19:72:E7:BB\r\n\
         a=group:BUNDLE 0 hxI i1X mxk B3D kNI nbB xIZ bKm Hkn\r\n\
         a=ice-options:trickle\r\n\
         a=msid-semantic:WMS *\r\n\
@@ -1307,9 +1651,13 @@ mod test {
         m=application 9999 UDP/DTLS/SCTP webrtc-datachannel\r\n\
         a=mid:0\r\n\
         a=ice-options:ice2\r\n\
-        a=ice-ufrag:libp2p+webrtc+v1/a75469cf670c4079f8c06af4a963c8a1:libp2p+webrtc+v1/a75469cf670c4079f8c06af4a963c8a1\r\n\
-        a=ice-pwd:libp2p+webrtc+v1/a75469cf670c4079f8c06af4a963c8a1:libp2p+webrtc+v1/a75469cf670c4079f8c06af4a963c8a1\r\n\
-        a=fingerprint:sha-256 FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF\r\n\
+        a=ice-ufrag:libp2p+webrtc+v1/a75469cf670c4079f8c06af4a963c8a1:\
+            libp2p+webrtc+v1/a75469cf670c4079f8c06af4a963c8a1\r\n\
+        a=ice-pwd:libp2p+webrtc+v1/a75469cf670c4079f8c06af4a963c8a1:\
+            libp2p+webrtc+v1/a75469cf670c4079f8c06af4a963c8a1\r\n\
+        a=fingerprint:sha-256 \
+            FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:\
+            FF:FF:FF:FF:FF\r\n\
         a=setup:actpass\r\n\
         a=sctp-port:5000\r\n\
         a=max-message-size:16384\r\n\
@@ -1318,6 +1666,94 @@ mod test {
         let parsed = sdp_parser().parse(sdp);
         println!("{:?}", parsed);
         parsed.expect("to parse ok");
+    }
+
+    /// Test parsing an SDP offer containing H.265 with sprop-max-don-diff.
+    /// Verifies the fmtp line is correctly parsed into FormatParam::SpropMaxDonDiff
+    /// alongside H265ProfileTierLevel.
+    #[test]
+    fn parse_sdp_h265_with_sprop_max_don_diff() {
+        // Fingerprint split across lines to stay within 110 cols.
+        let sdp = concat!(
+            "v=0\r\n",
+            "o=- 1234567890 2 IN IP4 127.0.0.1\r\n",
+            "s=-\r\n",
+            "t=0 0\r\n",
+            "a=group:BUNDLE 0\r\n",
+            "a=fingerprint:sha-256 ",
+            "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:",
+            "66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:",
+            "22:33:44:55:66:77:88:99\r\n",
+            "a=msid-semantic: WMS\r\n",
+            "m=video 9 UDP/TLS/RTP/SAVPF 102 103\r\n",
+            "c=IN IP4 0.0.0.0\r\n",
+            "a=rtcp:9 IN IP4 0.0.0.0\r\n",
+            "a=ice-ufrag:abcd\r\n",
+            "a=ice-pwd:abcdefghijklmnopqrstuv\r\n",
+            "a=ice-options:trickle\r\n",
+            "a=fingerprint:sha-256 ",
+            "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:",
+            "66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:",
+            "22:33:44:55:66:77:88:99\r\n",
+            "a=setup:actpass\r\n",
+            "a=mid:0\r\n",
+            "a=sendrecv\r\n",
+            "a=rtpmap:102 H265/90000\r\n",
+            "a=fmtp:102 profile-id=1;tier-flag=0;",
+            "level-id=93;sprop-max-don-diff=32\r\n",
+            "a=rtpmap:103 rtx/90000\r\n",
+            "a=fmtp:103 apt=102\r\n",
+        );
+
+        let (sdp, _remaining) = sdp_parser().parse(sdp).expect("SDP should parse");
+
+        // Find the video media section
+        assert_eq!(sdp.media_lines.len(), 1);
+        let media = &sdp.media_lines[0];
+
+        // Find fmtp for PT 102 (H.265)
+        let fmtp_values: Vec<_> = media
+            .attrs
+            .iter()
+            .filter_map(|a| {
+                if let MediaAttribute::Fmtp { pt, values } = a {
+                    if *pt == 102.into() {
+                        return Some(values.clone());
+                    }
+                }
+                None
+            })
+            .flatten()
+            .collect();
+
+        // Should contain H265ProfileTierLevel
+        assert!(
+            fmtp_values
+                .iter()
+                .any(|p| matches!(p, FormatParam::H265ProfileTierLevel(_))),
+            "Should have H265ProfileTierLevel param"
+        );
+
+        // Should contain SpropMaxDonDiff(32)
+        assert!(
+            fmtp_values
+                .iter()
+                .any(|p| matches!(p, FormatParam::SpropMaxDonDiff(32))),
+            "Should have SpropMaxDonDiff(32) param, got: {:?}",
+            fmtp_values
+        );
+
+        // Verify PTL values
+        if let Some(FormatParam::H265ProfileTierLevel(ptl)) = fmtp_values
+            .iter()
+            .find(|p| matches!(p, FormatParam::H265ProfileTierLevel(_)))
+        {
+            assert_eq!(ptl.profile_id(), 1);
+            assert_eq!(ptl.tier_flag(), 0);
+            assert_eq!(ptl.level_id(), 93);
+        } else {
+            panic!("H265ProfileTierLevel not found");
+        }
     }
 }
 
@@ -1334,7 +1770,8 @@ mod test {
 // a=ice-ufrag:CTNF
 // a=ice-pwd:XbIkl+k8mwLz60TFwb9crzbz
 // a=ice-options:trickle
-// a=fingerprint:sha-256 77:8C:32:B8:DA:4E:78:64:C8:4A:2A:E2:1D:60:2A:83:6B:51:B8:D5:EE:5A:ED:75:4E:C6:98:2D:78:4D:94:D8
+// a=fingerprint:sha-256 77:8C:32:B8:DA:4E:78:64:C8:4A:2A:E2:1D:60:2A:83:6B:51:B8:D5:EE:\
+// 5A:ED:75:4E:C6:98:2D:78:4D:94:D8
 // a=setup:actpass
 // a=mid:0
 // a=extmap:1 urn:ietf:params:rtp-hdrext:ssrc-audio-level
@@ -1374,7 +1811,8 @@ mod test {
 // a=ice-ufrag:Y28C
 // a=ice-pwd:W6fHYINgGi9QF0BHdM/kchTW
 // a=ice-options:trickle
-// a=fingerprint:sha-256 E0:C0:2D:52:8D:FA:14:69:A0:A5:5D:63:E0:82:92:DB:37:38:D2:F3:12:D0:1F:4E:E5:6F:1A:F5:C3:97:6B:32
+// a=fingerprint:sha-256 E0:C0:2D:52:8D:FA:14:69:A0:A5:5D:63:E0:82:92:DB:37:38:D2:F3:12:\
+// D0:1F:4E:E5:6F:1A:F5:C3:97:6B:32
 // a=setup:actpass
 // a=mid:0
 // a=extmap:1 urn:ietf:params:rtp-hdrext:ssrc-audio-level
@@ -1422,13 +1860,15 @@ mod test {
 // a=group:BUNDLE 0
 // a=extmap-allow-mixed
 // a=msid-semantic: WMS
-// m=video 9 UDP/TLS/RTP/SAVPF 96 97 102 103 104 105 106 107 108 109 127 125 39 40 45 46 98 99 100 101 112 113 114
+// m=video 9 UDP/TLS/RTP/SAVPF 96 97 102 103 104 105 106 107 108 109 127 125 39 40 45 46 98 99 100 101 112 113
+// 114
 // c=IN IP4 0.0.0.0
 // a=rtcp:9 IN IP4 0.0.0.0
 // a=ice-ufrag:numD
 // a=ice-pwd:L/hHurqERpVUACiI8To+vXLv
 // a=ice-options:trickle
-// a=fingerprint:sha-256 A5:79:72:59:3D:32:74:9C:44:70:DE:39:15:C3:99:51:32:6E:0D:F0:60:DD:2F:31:90:E5:96:B4:1D:CA:48:E1
+// a=fingerprint:sha-256 A5:79:72:59:3D:32:74:9C:44:70:DE:39:15:C3:99:51:32:6E:0D:F0:60:\
+// DD:2F:31:90:E5:96:B4:1D:CA:48:E1
 // a=setup:actpass
 // a=mid:0
 // a=extmap:1 urn:ietf:params:rtp-hdrext:toffset
@@ -1558,7 +1998,8 @@ mod test {
 // a=ice-ufrag:HhS+
 // a=ice-pwd:FhYTGhlAtKCe6KFIX8b+AThW
 // a=ice-options:trickle
-// a=fingerprint:sha-256 B4:12:1C:7C:7D:ED:F1:FA:61:07:57:9C:29:BE:58:E3:BC:41:E7:13:8E:7D:D3:9D:1F:94:6E:A5:23:46:94:23
+// a=fingerprint:sha-256 B4:12:1C:7C:7D:ED:F1:FA:61:07:57:9C:29:BE:58:E3:BC:41:E7:13:8E:\
+// 7D:D3:9D:1F:94:6E:A5:23:46:94:23
 // a=setup:actpass
 // a=mid:0
 // a=sctp-port:5000

@@ -1,4 +1,5 @@
 #![allow(unused)]
+use std::cell::Cell;
 use std::io::Cursor;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::ops::{Deref, DerefMut};
@@ -8,6 +9,7 @@ use std::time::{Duration, Instant};
 use netem::{Input as NetemInput, Netem, NetemConfig, Output as NetemOutput};
 
 use pcap_file::pcap::PcapReader;
+use str0m::Candidate;
 use str0m::change::SdpApi;
 use str0m::crypto::CryptoProvider;
 use str0m::format::Codec;
@@ -16,10 +18,9 @@ use str0m::net::Protocol;
 use str0m::net::Receive;
 use str0m::rtp::ExtensionMap;
 use str0m::rtp::RtpHeader;
-use str0m::Candidate;
-use str0m::{Event, Input, Output, Rtc, RtcError};
-use tracing::info_span;
+use str0m::{Event, Input, Output, Rtc, RtcConfig, RtcError};
 use tracing::Span;
+use tracing::info_span;
 
 /// Peer for test peers - Left or Right.
 /// Used to determine which crypto provider to use based on environment variables.
@@ -88,6 +89,20 @@ impl TestRtc {
             Rtc::new(now)
         };
 
+        Self::new_with_rtc(peer.span(), rtc)
+    }
+
+    /// Like [`TestRtc::new`], but lets the caller customise the `RtcConfig`
+    /// builder — e.g. to enable a non-default codec such as H.266.
+    pub fn new_with_config(peer: Peer, f: impl FnOnce(RtcConfig) -> RtcConfig) -> Self {
+        let now = Instant::now();
+        let builder = Rtc::builder();
+        let builder = if let Some(crypto) = peer.crypto_provider() {
+            builder.set_crypto_provider(crypto)
+        } else {
+            builder
+        };
+        let rtc = f(builder).build(now);
         Self::new_with_rtc(peer.span(), rtc)
     }
 
@@ -176,6 +191,14 @@ impl TestRtc {
             .cloned()
             .unwrap()
     }
+
+    pub fn params_h266(&self) -> PayloadParams {
+        self.rtc
+            .codec_config()
+            .find(|p| p.spec().codec == Codec::H266)
+            .cloned()
+            .unwrap()
+    }
 }
 
 /// Progress time forward by processing the next event.
@@ -226,6 +249,26 @@ pub fn progress(l: &mut TestRtc, r: &mut TestRtc) -> Result<(), RtcError> {
     }
 
     Ok(())
+}
+
+thread_local! {
+    /// When set, [`rtc_poll_to_timeout`] asserts every [`Output::Transmit`]
+    /// for which `contents.len() <= mtu`.
+    static STRICT_MTU: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+struct StrictMtuGuard(Option<usize>);
+impl Drop for StrictMtuGuard {
+    fn drop(&mut self) {
+        STRICT_MTU.with(|c| c.set(self.0));
+    }
+}
+
+/// Like [`progress`] but asserts every outgoing datagram is `<= mtu` bytes.
+pub fn progress_strict_mtu(l: &mut TestRtc, r: &mut TestRtc, mtu: usize) -> Result<(), RtcError> {
+    let prev = STRICT_MTU.with(|c| c.replace(Some(mtu)));
+    let _guard = StrictMtuGuard(prev);
+    progress(l, r)
 }
 
 fn progress_one(
@@ -310,6 +353,17 @@ fn rtc_poll_to_timeout(
                 break;
             }
             Output::Transmit(v) => {
+                if let Some(mtu) = STRICT_MTU.with(|c| c.get()) {
+                    assert!(
+                        v.contents.len() <= mtu,
+                        "outgoing datagram {} bytes exceeds strict mtu {} (proto={:?}, {}->{})",
+                        v.contents.len(),
+                        mtu,
+                        v.proto,
+                        v.source,
+                        v.destination,
+                    );
+                }
                 let packet = PendingPacket {
                     proto: v.proto,
                     source: v.source,
@@ -374,7 +428,7 @@ impl DerefMut for TestRtc {
 }
 
 pub fn init_log() {
-    use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+    use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("off"));
 
@@ -402,8 +456,12 @@ fn get_crypto_provider_by_name(name: &str) -> CryptoProvider {
         #[cfg(feature = "rust-crypto")]
         "rust-crypto" => str0m_rust_crypto::default_provider(),
 
-        #[cfg(feature = "openssl")]
+        // If both openssl and openssl-dimpl are declared, only openssl-dimpl is available.
+        #[cfg(all(feature = "openssl", not(feature = "openssl-dimpl")))]
         "openssl" => str0m_openssl::default_provider(),
+
+        #[cfg(feature = "openssl-dimpl")]
+        "openssl-dimpl" => str0m_openssl::default_provider(),
 
         #[cfg(all(feature = "wincrypto", target_os = "windows"))]
         "wincrypto" => str0m_wincrypto::default_provider(),
@@ -412,13 +470,16 @@ fn get_crypto_provider_by_name(name: &str) -> CryptoProvider {
         "apple-crypto" => str0m_apple_crypto::default_provider(),
 
         _ => {
-            let mut available = Vec::new();
+            let mut available: Vec<&'static str> = Vec::new();
             #[cfg(feature = "aws-lc-rs")]
             available.push("aws-lc-rs");
             #[cfg(feature = "rust-crypto")]
             available.push("rust-crypto");
-            #[cfg(feature = "openssl")]
+            // If both openssl and openssl-dimpl are declared, only openssl-dimpl is available.
+            #[cfg(all(feature = "openssl", not(feature = "openssl-dimpl")))]
             available.push("openssl");
+            #[cfg(feature = "openssl-dimpl")]
+            available.push("openssl-dimpl");
             #[cfg(all(feature = "wincrypto", target_os = "windows"))]
             available.push("wincrypto");
             #[cfg(all(feature = "apple-crypto", target_vendor = "apple"))]
@@ -516,6 +577,76 @@ pub fn av1_data() -> PcapData {
 
 pub fn h265_data() -> PcapData {
     load_pcap_data(include_bytes!("data/h265.pcap"))
+}
+
+pub fn h266_data() -> PcapData {
+    load_pcap_data(include_bytes!("data/h266.pcap"))
+}
+
+// ---------------------------------------------------------------------------
+// SNAP (SCTP Negotiation Acceleration Protocol) test helpers
+// ---------------------------------------------------------------------------
+
+/// Extract the `a=sctp-init:<value>` from an SDP string, if present.
+pub fn extract_sctp_init(sdp: &str) -> Option<String> {
+    sdp.lines()
+        .find(|l| l.starts_with("a=sctp-init:"))
+        .map(|l| l.trim_start_matches("a=sctp-init:").to_string())
+}
+
+/// Replace the `a=sctp-init:` attribute value in an SDP string.
+///
+/// Preserves original line endings (`\r\n`).
+pub fn replace_sctp_init(sdp: &str, replacement: &str) -> String {
+    let mut result = String::with_capacity(sdp.len());
+    // split("\r\n") produces an extra empty element after a trailing CRLF;
+    // skip it to avoid appending a spurious double-CRLF at the end.
+    for line in sdp.split("\r\n") {
+        if line.is_empty() && result.ends_with("\r\n") {
+            continue;
+        }
+        if line.starts_with("a=sctp-init:") {
+            result.push_str(&format!("a=sctp-init:{replacement}\r\n"));
+        } else {
+            result.push_str(line);
+            result.push_str("\r\n");
+        }
+    }
+    result
+}
+
+/// Remove the `a=sctp-init:` attribute from an SDP string.
+///
+/// Preserves original line endings (`\r\n`).
+pub fn remove_sctp_init(sdp: &str) -> String {
+    let mut result = String::with_capacity(sdp.len());
+    // split("\r\n") produces an extra empty element after a trailing CRLF;
+    // skip it to avoid appending a spurious double-CRLF at the end.
+    for line in sdp.split("\r\n") {
+        if line.is_empty() && result.ends_with("\r\n") {
+            continue;
+        }
+        if !line.starts_with("a=sctp-init:") {
+            result.push_str(line);
+            result.push_str("\r\n");
+        }
+    }
+    result
+}
+
+/// Generate SNAP init data for out-of-band SCTP negotiation.
+///
+/// Returns `Some((local_init_bytes, SctpInitData))` when `use_snap` is true, `None` otherwise.
+pub fn snap_init_data(use_snap: bool) -> Option<(Vec<u8>, str0m::channel::SctpInitData)> {
+    if use_snap {
+        let mut data = str0m::channel::SctpInitData::new();
+        let local_init = data
+            .local_init_chunk()
+            .expect("generate_snap_token should not fail");
+        Some((local_init, data))
+    } else {
+        None
+    }
 }
 
 pub fn load_pcap_data(data: &[u8]) -> PcapData {

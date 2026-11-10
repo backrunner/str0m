@@ -35,6 +35,14 @@ impl Packetizer for G7xxPacketizer {
     fn is_marker(&mut self, _data: &[u8], _previous: Option<&[u8]>, _last: bool) -> bool {
         false
     }
+
+    fn marks_talkspurt(&self) -> bool {
+        true
+    }
+
+    fn nackable(&self) -> bool {
+        false
+    }
 }
 
 /// Depacketizer for G711 packets
@@ -141,6 +149,24 @@ mod test {
         pck.depacketize(raw_bytes, &mut out, &mut extra)?;
         assert_eq!(raw_bytes, &out, "Payload must be same");
 
+        Ok(())
+    }
+
+    #[test]
+    fn packetize_respects_mtu() -> Result<(), PacketError> {
+        let payload = vec![0xABu8; 2000];
+        for &mtu in &[100usize, 300, 600, 1200] {
+            let mut pck = G711Packetizer::default();
+            let pkts = pck.packetize(mtu, &payload)?;
+            assert!(!pkts.is_empty(), "G7xx produced no packets at mtu {mtu}");
+            for (i, pkt) in pkts.iter().enumerate() {
+                assert!(
+                    pkt.len() <= mtu,
+                    "G7xx packet {i} size {} > mtu {mtu}",
+                    pkt.len()
+                );
+            }
+        }
         Ok(())
     }
 }
